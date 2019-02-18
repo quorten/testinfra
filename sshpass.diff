@@ -1,0 +1,30 @@
+diff -Naurp new/testinfra/main.py old/testinfra/main.py
+--- new/testinfra/main.py	2017-05-29 12:30:09.000000000 -0500
++++ old/testinfra/main.py	2017-10-04 13:33:04.000000000 -0500
+@@ -11,7 +11,9 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import os
+ import shutil
++import subprocess
+ import sys
+ import tempfile
+ import time
+@@ -83,6 +85,16 @@ class RedirectStdStreams(object):
+ 
+ 
+ def main():
++    # check if sshpass is installed
++    if "--use-sshpass" in sys.argv:
++        with open(os.devnull, 'w') as FNULL:
++            try:
++                # redirect stdout to devnull so it does not clutter stdout
++                subprocess.check_call('sshpass -V', stdout=FNULL, shell=True)
++            except subprocess.CalledProcessError:
++                print "Error when running sshpass, its possible its not installed"
++                raise
++
+     if "--nagios" in sys.argv:
+         out = tempfile.SpooledTemporaryFile()
+         # Compat: In 2.7 SpooledTemporaryFile has no encoding param

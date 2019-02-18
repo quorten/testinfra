@@ -1,0 +1,163 @@
+diff -Naurp new/testinfra/plugin.py old/testinfra/plugin.py
+--- new/testinfra/plugin.py	2017-05-29 12:30:09.000000000 -0500
++++ old/testinfra/plugin.py	2017-10-04 13:33:04.000000000 -0500
+@@ -12,6 +12,6 @@
+ # limitations under the License.
+ # pylint: disable=redefined-outer-name
+ 
+ from __future__ import unicode_literals
+ 
+ import logging
+@@ -22,6 +27,7 @@ import testinfra
+ import testinfra.host
+ import testinfra.modules
+ import testinfra.utils as utils
++from testinfra.utils import markers
+ 
+ 
+ def _generate_fixtures():
+@@ -29,6 +35,14 @@ def _generate_fixtures():
+     for modname in testinfra.modules.modules:
+         modname = modname.title().replace("_", "")
+ 
++        # TODO: Once all Testinfra tests have been converted to use new 1.6 host
++        #       fixture and Testinfra no longer supports using fixtures without
++        #       host, remove following if block.
++        #       Tests refer to 'FSInfo', while code above changes to 'FsInfo',
++        #       breaking tests.
++        if modname == 'FsInfo':
++            modname = 'FSInfo'
++
+         def get_fixture(name):
+             new_name = utils.un_camel_case(name)
+ 
+@@ -78,7 +92,7 @@ def pytest_addoption(parser):
+         dest="connection",
+         help=(
+             "Remote connection backend (paramiko, ssh, safe-ssh, "
+-            "salt, docker, ansible)"
++            "salt, docker, ansible, winrm)"
+         )
+     )
+     group.addoption(
+@@ -117,6 +131,28 @@ def pytest_addoption(parser):
+         dest="nagios",
+         help="Nagios plugin",
+     )
++    group.addoption(
++        "--winrm-config",
++        action="store",
++        dest="winrm_config",
++        help=("Credentials for winrm, required if using winrm and not "
++              "using ansible inventory file")
++    )
++    group.addoption(
++        "--use-sshpass",
++        action="store_true",
++        default=False,
++        dest="use_sshpass",
++        help=("Toggle for using sshpass, will attempt to use ansible "
++              "inventory file or sshpass file")
++    )
++    group.addoption(
++        "--sshpass-file",
++        action="store",
++        dest="sshpass_file",
++        help=("If using sshpass, this file will be passed as param -f; "
++              "takes precedence over ansible inventory file")
++    )
+ 
+ 
+ def pytest_generate_tests(metafunc):
+@@ -125,6 +161,8 @@ def pytest_generate_tests(metafunc):
+             hosts = metafunc.config.option.hosts.split(",")
+         elif hasattr(metafunc.module, "testinfra_hosts"):
+             hosts = metafunc.module.testinfra_hosts
++        elif metafunc.config.option.ansible_inventory is not None:
++            hosts = testinfra.backend.parse_ansible_inventory(metafunc.config.option.ansible_inventory).keys()
+         else:
+             hosts = [None]
+         params = testinfra.get_hosts(
+@@ -134,6 +172,9 @@ def pytest_generate_tests(metafunc):
+             sudo=metafunc.config.option.sudo,
+             sudo_user=metafunc.config.option.sudo_user,
+             ansible_inventory=metafunc.config.option.ansible_inventory,
++            winrm_config=metafunc.config.option.winrm_config,
++            use_sshpass=metafunc.config.option.use_sshpass,
++            sshpass_file=metafunc.config.option.sshpass_file,
+         )
+         ids = [e.backend.get_pytest_id() for e in params]
+         metafunc.parametrize(
+@@ -165,6 +206,69 @@ def pytest_collection_finish(session):
+ 
+ 
+ def pytest_configure(config):
+-    if config.option.verbose > 1:
+-        logging.basicConfig()
+-        logging.getLogger("testinfra").setLevel(logging.DEBUG)
++    logging.basicConfig(filename='log.txt', filemode='w', level=logging.DEBUG, format='%(asctime)8s %(module)16s:%(lineno)-5d%(levelname)8s - %(message)s', datefmt='%I:%M:%S')
++    logging.getLogger("testinfra").setLevel(logging.DEBUG)
++
++
++def pytest_runtest_setup(item):
++    ansible_groups_marker = item.get_marker(markers.ansible_groups.markname)
++    valid_os_marker = item.get_marker(markers.valid_os.markname)
++    valid_arch_marker = item.get_marker(markers.valid_arch.markname)
++
++    # Since pytest_runtest_setup is called for EVERY test function, only get when necessary
++    get_host_information = (ansible_groups_marker is not None
++                            or valid_os_marker is not None
++                            or valid_arch_marker is not None)
++
++    if get_host_information:
++        ansible_inventory = item.callspec.metafunc.config.option.ansible_inventory
++        current_host = item.callspec.params['_testinfra_host']
++        host_vars = testinfra.backend.parse_ansible_inventory(ansible_inventory)[current_host.backend.get_hostname()]
++
++    if ansible_groups_marker is not None:
++        valid_groups = _marker_args_to_set(ansible_groups_marker)
++        host_groups = set(host_vars.get(markers.ansible_groups.markname))
++
++        if not valid_groups.intersection(host_groups):
++            pytest.skip("Invalid test for current host\n\t Valid groups: [%s]\n\t Host groups: [%s]" % (valid_groups, host_groups))
++
++    if valid_os_marker is not None:
++        valid_oses = _marker_args_to_set(valid_os_marker)
++
++        # since there are no distrubutions of windows, it gets handled differently
++        if current_host.system_info.type == utils.OS.WINDOWS:
++            host_os = current_host.system_info.type
++        else:
++            host_os = current_host.system_info.distribution
++
++        if host_os not in valid_oses:
++            pytest.skip('Invalid test for current host\n\t Valid OSes: [%s]\n\t Host OS: [%s]' % (valid_oses, host_os))
++
++    if valid_arch_marker is not None:
++        valid_archs = _marker_args_to_set(valid_arch_marker)
++        host_arch = current_host.system_info.architecture
++
++        if host_arch not in valid_archs:
++            pytest.skip('Invalid test for current host\n\t Valid architecures: [%s]\n\t Host architecture: [%s]' % (valid_archs, host_arch))
++
++
++def _marker_args_to_set(marker):
++    args_set = set()
++
++    # marker may appear multiple times, get args for each; will throw TypeError if hasn't
++    # appeared multiple times
++    try:
++        for info in marker:
++            items = _marker_args_csv_to_list(info.args)
++            args_set.update(set(items))
++    except TypeError:
++        items = _marker_args_csv_to_list(marker.args)
++        args_set.update(set(items))
++
++    return args_set
++
++# Converts marker args to list if it contains comma separated values
++def _marker_args_csv_to_list(marker_args):
++    if ',' in marker_args:
++        return [item.strip() for item in marker_args.split(',')]
++    return marker_args

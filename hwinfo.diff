@@ -1,0 +1,239 @@
+diff -Naurp new/testinfra/modules/hardwareinfo.py old/testinfra/modules/hardwareinfo.py
+--- new/testinfra/modules/hardwareinfo.py	1969-12-31 18:00:00.000000000 -0600
++++ old/testinfra/modules/hardwareinfo.py	2017-10-04 13:33:04.000000000 -0500
+@@ -0,0 +1,235 @@
++# coding: utf-8
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import logging
++import pprint
++
++from testinfra.modules.base import InstanceModule
++
++logger = logging.getLogger("testinfra")
++
++
++class HardwareInfo(InstanceModule):
++    """Gathers hardware information from the machine"""
++
++    def __init__(self):
++        self._hwinfo = None
++        super(HardwareInfo, self).__init__()
++
++    @property
++    def hwinfo(self):
++        if self._hwinfo is None:
++            self._hwinfo = self.get_hardware_info()
++
++            logger.debug("Created dictionary with hardware system info:")
++            for line in pprint.pformat(self._hwinfo).splitlines():
++                logger.debug(line)
++
++        return self._hwinfo
++
++    def _get_linux_hwinfo(self):
++        hwinfo = {}
++        cpuinfo = {}
++        meminfo = {}
++
++        # ------------------------------------
++        # Memory information (units are in KB)
++        # ------------------------------------
++        cmd = self.run('cat /proc/meminfo | grep "MemTotal"')
++        if cmd.rc == 0:
++            meminfo['total_memory_KB'] = int(cmd.stdout.split()[1])
++
++        cmd = self.run('cat /proc/meminfo | grep "SwapTotal"')
++        if cmd.rc == 0:
++            meminfo['total_swap_KB'] = int(cmd.stdout.split()[1])
++
++        hwinfo['memory'] = meminfo
++
++        # -------------------
++        # Get CPU information
++        # -------------------
++        cmd = self.run('cat /proc/cpuinfo')
++        if cmd.rc == 0:
++
++            current_processor = -1
++            temp = {}
++
++            for line in cmd.stdout.splitlines():
++                if line == "":
++                    cpuinfo[current_processor] = temp
++                    temp = {}
++                elif line.split(':')[0].strip() == 'processor':
++                    current_processor = int(line.split(':')[1].strip())
++                else:
++                    key, value = line.split(':')
++                    key = key.strip()
++                    if key == "cpu MHz":
++                        key = "frequency"
++                    temp[key] = _get_value(value.strip())
++
++        hwinfo['cpu'] = cpuinfo
++        hwinfo['cpu']['total_processors'] = current_processor + 1
++
++        return hwinfo
++
++    def _get_solaris_hwinfo(self):
++        hwinfo = {}
++        cpuinfo = {}
++        meminfo = {}
++
++        # ------------------------------------
++        # Memory information (units are in KB)
++        # ------------------------------------
++        cmd = self.run('prtconf | grep "Memory"')
++        if cmd.rc == 0:
++            meminfo['total_memory_KB'] = int(cmd.stdout.split()[2]) * 1024
++
++        hwinfo['memory'] = meminfo
++
++        # -------------------
++        # Get CPU information
++        # -------------------
++        cmd = self.run('psrinfo')
++        if cmd.rc == 0:
++            cpuinfo['total_processors'] = int(len(cmd.stdout.splitlines()))
++
++        hwinfo['cpu'] = cpuinfo
++
++        return hwinfo
++
++    def _get_windows_hwinfo(self):
++        hwinfo = {}
++        cpuinfo = {"total_processors": 0}
++        meminfo = {}
++
++        # ------------------------------------
++        # Memory information (units are in KB)
++        # ------------------------------------
++        cmd = self.run("wmic memorychip get Capacity /value")
++
++        # Replace Windows line endings and remove excess whitespace
++        std_out = cmd.stdout.replace("\r\r\n", "\n").strip()
++
++        meminfo["total_memory_KB"] = 0
++
++        # Each block consists of a single line containing bank capacity
++        for line in std_out.split('\n\n\n'):
++            key, value = line.split('=')
++            meminfo["total_memory_KB"] += int(value) / 1024.0
++
++        hwinfo['memory'] = meminfo
++
++        # ---------------
++        # CPU information
++        # ---------------
++        cmd = self.run("wmic cpu get MaxClockSpeed,DeviceID,NumberOfCores,NumberOfLogicalProcessors /value")
++        if cmd.rc == 0:
++            index = 0
++            mask = {
++                "MaxClockSpeed": "frequency",
++                "DeviceID": "device_id",
++                "NumberOfCores": "number_of_cores",
++                "NumberOfLogicalProcessors": "number_of_threads",
++            }
++
++            # Replace Windows line endings and remove excess whitespace
++            std_out = cmd.stdout.replace("\r\r\n", "\n").strip()
++            for block in std_out.split("\n\n\n"):
++                cpu = {}
++                for line in block.splitlines():
++                    key, value = line.split("=")
++
++                    if key == "MaxClockSpeed":
++                        cpu[mask[key]] = float(value)
++                    elif (key == "NumberOfCores" or
++                          key == "NumberOfLogicalProcessors"):
++                        cpu[mask[key]] = int(value)
++                    else:
++                        cpu[mask[key]] = value
++
++                cpuinfo[index] = cpu
++                index += 1
++                cpuinfo["total_processors"] += cpu["number_of_cores"]
++
++        hwinfo['cpu'] = cpuinfo
++
++        return hwinfo
++
++    def get_hardware_info(self):
++        hwinfo = {
++            'cpu': None,
++            'memory': None,
++        }
++
++        cmd = self.run("uname -s")
++        if cmd.rc == 0:
++            os = cmd.stdout.strip().lower()
++            if os == "linux":
++                hwinfo.update(**self._get_linux_hwinfo())
++            elif os == "sunos":
++                hwinfo.update(**self._get_solaris_hwinfo())
++            elif "cygwin" in os:
++
++                # Windows with Cygwin installed
++                hwinfo.update(**self._get_windows_hwinfo())
++        else:
++            cmd = self.run("ver")
++
++            if cmd.rc == 0:
++                if "windows" in cmd.stdout.strip().lower():
++
++                    # Windows
++                    hwinfo.update(**self._get_windows_hwinfo())
++
++        return hwinfo
++
++    @property
++    def cpu(self):
++        """Returns a dictionary with CPU information
++        Keys: total_processors.
++
++        For Linux systems, other keys include processor indices, whose
++        values are dictionaries with information about the corresponding
++        processor. This information comes from /proc/cpuinfo
++
++        For Windows systems, other keys include processor indices, whose
++        values are dictionaries with keys device_id, frequency,
++        number_of_cores, number_of_threads.
++
++        >>> host.hardware_info.cpu['total_processors']
++        2
++
++        >>> host.hardware_info.cpu[1]['frequency']
++        2500.030
++        """
++        return self.hwinfo['cpu']
++
++    @property
++    def memory(self):
++        """Returns dictionary with memory information
++        Keys:  total_memory_KB, total_swap_KB (for Linux only)
++
++        >>> host.hardware_info.memory['total_memory_KB']
++        8388608
++        """
++        return self.hwinfo['memory']
++
++
++def _get_value(value):
++    if value.isdigit():
++        return int(value)
++    else:
++        try:
++            return float(value)
++        except ValueError:
++            return value

@@ -1,0 +1,351 @@
+diff -Naurp new/testinfra/modules/fsinfo.py old/testinfra/modules/fsinfo.py
+--- new/testinfra/modules/fsinfo.py	1969-12-31 18:00:00.000000000 -0600
++++ old/testinfra/modules/fsinfo.py	2017-10-04 13:33:04.000000000 -0500
+@@ -0,0 +1,347 @@
++# coding: utf-8
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import logging
++import pprint
++import re
++
++from testinfra.modules.base import InstanceModule
++
++logger = logging.getLogger("testinfra")
++
++
++class FSInfo(InstanceModule):
++    """Provides information about file systems"""
++
++    def __init__(self):
++        self._fs_info = None
++        super(FSInfo, self).__init__()
++
++    @property
++    def fs_info(self):
++        """Returns a dict of file system information"""
++
++        if self._fs_info is None:
++            self._fs_info = self.get_fs_info()
++            logger.debug("Created data structure with file system info:")
++            for line in pprint.pformat(self._fs_info).splitlines():
++                logger.debug(line)
++        return self._fs_info
++
++    def get_fs_info(self):
++        fs_info = []
++
++        uname = self.run("uname")
++        if uname.rc == 0:
++            os_type = uname.stdout.strip().lower()
++            if os_type == "linux":
++
++                # RedHat
++                fs_info.extend(self._get_linux_fs_info())
++            elif os_type == "sunos":
++
++                # Solaris_x86, Solaris (SPARC)
++                fs_info.extend(self._get_solaris_fs_info())
++
++            elif "cygwin" in os_type:
++
++                # Windows with Cygwin installed
++                fs_info.extend(self._get_windows_fs_info())
++        else:
++            ver = self.run("ver")
++
++            if ver.rc == 0:
++                if "windows" in ver.stdout.strip().lower():
++
++                    # Windows
++                    fs_info.extend(self._get_windows_fs_info())
++
++        return fs_info
++
++    # -------------------
++    #  RedHat
++    # -------------------
++    def _get_linux_fs_info(self):
++        fs_info = []
++
++        # -P for portability (POSIX) and -T for type
++        redhat_df = self.run("df -PT")
++        if redhat_df.rc == 0:
++            regx = r"(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)"
++
++            # [1:] skips first element
++            for line in redhat_df.stdout.splitlines()[1:]:
++                match = re.search(regx, line)
++
++                if match:
++                    fs_info.append({
++                        "device": match.groups()[0],
++                        "type": match.groups()[1],
++                        "mount": match.groups()[6],
++                        "percent_used": int(match.groups()[5].strip('%')),
++                        "size_available_KB": int(match.groups()[4]),
++                        "size_total_KB": int(match.groups()[2]),
++                        "size_used_KB": int(match.groups()[3]),
++                        "has_mount_options": {
++                            "acl": False,
++                            "xattr": False,
++                        },
++                    })
++
++        proc_swaps = self.run("cat /proc/swaps")
++        if proc_swaps.rc == 0:
++            for line in proc_swaps.stdout.splitlines():
++                match = re.search(r"(\S+)\s+\S+\s+(\d+)\s+(\d+)", line)
++
++                if match:
++                    device = match.groups()[0]
++                    index = self._search_by_device(fs_info, device)
++                    if index == -1:
++                        fs_info.append({
++                            "device": device,
++                            "type": "swap",
++                            "mount": None,
++                            "percent_used": None,
++                            "size_available_KB": None,
++                            "size_total_KB": int(match.groups()[1]),
++                            "size_used_KB": int(match.groups()[2]),
++                            "has_mount_options": {
++                                "acl": False,
++                                "user_xattr": False,
++                            },
++                        })
++
++        proc_partitions = self.run("cat /proc/partitions")
++        if proc_partitions.rc == 0:
++            for line in proc_partitions.stdout.splitlines():
++                match = re.search(r"\S+\s+\S+\s+(\d+)\s+(\S+)", line)
++
++                if match:
++                    device = "/dev/" + match.groups()[1]
++                    index = self._search_by_device(fs_info, device)
++                    if index == -1:
++                        fs_info.append({
++                            "device": device,
++                            "type": None,
++                            "mount": None,
++                            "percent_used": None,
++                            "size_available_KB": None,
++                            "size_total_KB": int(match.groups()[0]),
++                            "size_used_KB": None,
++                            "has_mount_options": {
++                                "acl": False,
++                                "user_xattr": False,
++                            },
++                        })
++
++        # Get mount options
++        fstab_partitions = self.run("cat /etc/fstab")
++        if fstab_partitions.rc == 0:
++            for line in fstab_partitions.stdout.splitlines():
++                match = re.search(r"(\S)+\s+(\S+)\s+(\S)+\s+(\S+)\s+",
++                                  line)
++
++                if match:
++                    mount = match.groups()[1]
++                    index = self._search_by_mount(fs_info, mount)
++
++                    if index == -1:
++                        fs_info.append({
++                            "device": match.groups()[0],
++                            "type": match.groups()[2],
++                            "mount": mount,
++                            "percent_used": None,
++                            "size_available_KB": None,
++                            "size_total_KB": None,
++                            "size_used_KB": None,
++                            "has_mount_options": {
++                                "acl": False,
++                                "user_xattr": False,
++                            }
++                        })
++
++                    for option in match.groups()[3].split(","):
++                        fs_info[index]["has_mount_options"].update({
++                            option: True,
++                        })
++
++        return fs_info
++
++    # ------------------------------
++    #  Solaris_x86, Solaris (SPARC)
++    # ------------------------------
++    def _get_solaris_fs_info(self):
++        fs_info = []
++
++        solaris_df = self.run("df -k")
++        if solaris_df.rc == 0:
++            regex = r"(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)"
++
++            # [1:] skips first element
++            for line in solaris_df.stdout.splitlines()[1:]:
++                match = re.search(regex, line)
++
++                if match:
++                    fs_info.append({
++                        "device": match.groups()[0],
++                        "mount": match.groups()[5],
++                        "percent_used": int(match.groups()[4].strip('%')),
++                        "size_available_KB": int(match.groups()[3]),
++                        "size_total_KB": int(match.groups()[1]),
++                        "size_used_KB": int(match.groups()[2]),
++                        "has_mount_options": {
++                            "acl": False,
++                            "xattr": False,
++                        }
++                    })
++
++            # Get file system types
++            df_n = self.run("df -n")
++            if df_n.rc == 0:
++                for line in df_n.stdout.splitlines():
++                    mount, fs_type = line.split(":")
++                    mount = mount.strip()
++                    fs_type = fs_type.strip()
++                    index = self._search_by_mount(fs_info, mount)
++                    fs_info[index]["type"] = fs_type
++
++            # Get mount options
++            fstab_partitions = self.run("cat /etc/mnttab")
++            if fstab_partitions.rc == 0:
++                for line in fstab_partitions.stdout.splitlines():
++                    match = re.search(r"(\S)+\s+(\S+)\s+(\S)+\s+(\S+)\s+", line)
++
++                    if match:
++                        mount = match.groups()[1]
++                        index = self._search_by_mount(fs_info, mount)
++
++                        if index == -1:
++                            fs_info.append({
++                                "device": match.groups()[0],
++                                "type": match.groups()[2],
++                                "mount": mount,
++                                "percent_used": None,
++                                "size_available_KB": None,
++                                "size_total_KB": None,
++                                "size_used_KB": None,
++                                "has_mount_options": {
++                                    "acl": False,
++                                    "xattr": False,
++                                }
++                            })
++
++                        for option in match.groups()[3].split(","):
++                            fs_info[index]["has_mount_options"].update({
++                                option: True,
++                            })
++
++        return fs_info
++
++    # -------------------
++    #  Windows
++    # -------------------
++    def _get_windows_fs_info(self):
++        fs_info = []
++
++        wmic = self.run("wmic volume get Capacity,DeviceID,DriveLetter,FileSystem,FreeSpace,Name /value")
++        if wmic.rc == 0:
++            mask = {
++                "Capacity": "size_total_KB",
++                "DeviceID": "device",
++                "DriveLetter": "mount",
++                "FileSystem": "type",
++                "FreeSpace": "size_available_KB",
++                "Name": "name",
++            }
++
++            # Replace Windows line endings and remove excess whitespace
++            std_out = wmic.stdout.replace("\r\r\n", "\n").strip()
++
++            # Each block in stdout represents a volume
++            for block in std_out.split("\n\n\n"):
++                vol = {}
++                for line in block.splitlines():
++                    key, value = line.split("=")
++
++                    if value == "":
++                        value = None
++
++                    if (key == "Capacity" or key == "FreeSpace") and value is not None:
++                        vol[mask[key]] = int(value) / 1024.0
++                    else:
++                        vol[mask[key]] = value
++
++                if vol["size_total_KB"] is not None and vol["size_available_KB"] is not None:
++                    vol["size_used_KB"] = (vol["size_total_KB"] - vol["size_available_KB"])
++                    percent_used = int((float(vol["size_used_KB"]) / float(vol["size_total_KB"])) * 100)
++                    vol["percent_used"] = percent_used
++
++                fs_info.append(vol)
++
++        return fs_info
++
++    @classmethod
++    def _search_by_device(cls, obj, device):
++        index = -1
++        for i in range(0, len(obj)):
++            if obj[i]["device"] == device:
++                index = i
++        return index
++
++    @classmethod
++    def _search_by_mount(cls, obj, mount):
++        index = -1
++        for i in range(0, len(obj)):
++            if obj[i]["mount"] == mount:
++                index = i
++        return index
++
++    def by_mount(self, mount):
++        """Returns a dict of file system information about mount
++
++        Keys: size_total_KB, size_used_KB, size_available_KB,
++        percent_used, device, type, mount, has_mount_options
++
++        Windows has additional key: name
++
++        >>> host.fs_info.by_mount("/")["size_total_KB"]
++        5159552
++        >>> host.fs_info.by_mount("/")["size_available_KB"]
++        4756156
++        """
++
++        index = self._search_by_mount(self.fs_info, mount)
++        if index != -1:
++            return self.fs_info[index]
++        else:
++            raise KeyError(mount)
++
++    def by_device(self, device):
++        """Returns a dict of file system information about device
++
++        Keys: size_total_KB, size_used_KB, size_available_KB,
++        percent_used, device, type, mount, has_mount_options
++
++        Windows has additional key: name
++
++        >>> host.fs_info.by_device("/dev/sda1")["size_total_KB"]
++        5159552
++        >>> host.fs_info.by_device("/dev/sda1")["size_available_KB"]
++        4756156
++        """
++
++        index = self._search_by_device(self.fs_info, device)
++        if index != -1:
++            return self.fs_info[index]
++        else:
++            raise KeyError(device)

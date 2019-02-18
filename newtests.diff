@@ -1,0 +1,684 @@
+diff -Naurp new/testinfra/test/test_modules.py old/testinfra/test/test_modules.py
+--- new/testinfra/test/test_modules.py	1969-12-31 18:00:00.000000000 -0600
++++ old/testinfra/test/test_modules.py	2017-10-04 13:33:04.000000000 -0500
+@@ -0,0 +1,382 @@
++# coding: utf-8
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++from __future__ import unicode_literals
++
++import crypt
++import datetime
++import re
++import time
++
++import pytest
++from testinfra.modules.socket import parse_socketspec
++
++all_images = pytest.mark.testinfra_hosts(*[
++    "docker://{}".format(image)
++    for image in (
++        "debian_jessie", "centos_7", "ubuntu_trusty", "fedora",
++    )
++])
++
++
++@all_images
++def test_package(docker_image, Package):
++    ssh = Package("openssh-server")
++    version = {
++        "debian_jessie": "1:6.7",
++        "debian_wheezy": "1:6.0",
++        "fedora": "7.",
++        "ubuntu_trusty": "1:6.6",
++        "centos_7": "6.6",
++    }[docker_image]
++    assert ssh.is_installed
++    assert ssh.version.startswith(version)
++
++
++def test_held_package(Package):
++    python = Package("python")
++    assert python.is_installed
++    assert python.version.startswith("2.7.9")
++
++
++@all_images
++def test_systeminfo(docker_image, SystemInfo):
++    assert SystemInfo.type == "linux"
++
++    release, distribution, codename = {
++        "debian_jessie": ("^8\.", "debian", "jessie"),
++        "debian_wheezy": ("^7$", "debian", None),
++        "centos_7": ("^7$", "centos", None),
++        "fedora": ("^23$", "fedora", None),
++        "ubuntu_trusty": ("^14\.04$", "ubuntu", "trusty"),
++    }[docker_image]
++
++    assert SystemInfo.distribution == distribution
++    assert SystemInfo.codename == codename
++    assert re.match(release, SystemInfo.release)
++
++
++@all_images
++def test_ssh_service(docker_image, Service):
++    if docker_image in ("centos_7", "fedora"):
++        name = "sshd"
++    else:
++        name = "ssh"
++
++    ssh = Service(name)
++    assert ssh.is_running
++
++    if docker_image != "ubuntu_trusty":
++        assert ssh.is_enabled
++    else:
++        assert not ssh.is_enabled
++
++
++@pytest.mark.parametrize("name,running,enabled", [
++    ("ntp", False, True),
++    ("salt-minion", False, False),
++])
++def test_service(Command, Service, name, running, enabled):
++
++    if name == "ntp":
++        # Systemd say no but sysv say yes
++        assert Command("systemctl is-enabled ntp").rc == 1
++
++    service = Service(name)
++    assert service.is_running == running
++    assert service.is_enabled == enabled
++
++
++def test_salt(Salt):
++    ssh_version = Salt("pkg.version", "openssh-server", local=True)
++    assert ssh_version.startswith("1:6.7")
++
++
++def test_puppet_resource(PuppetResource):
++    resource = PuppetResource("package", "openssh-server")
++    assert resource["openssh-server"]["ensure"].startswith("1:6.7")
++
++
++def test_facter(Facter):
++    assert Facter()["lsbdistcodename"] == "jessie"
++    assert Facter("lsbdistcodename") == {
++        "lsbdistcodename": "jessie",
++    }
++
++
++def test_sysctl(Sysctl, Command):
++    assert Sysctl("kernel.hostname") == Command.check_output("hostname")
++    assert isinstance(Sysctl("kernel.panic"), int)
++
++
++def test_parse_socketspec():
++    assert parse_socketspec("tcp://22") == ("tcp", None, 22)
++    assert parse_socketspec("tcp://:::22") == ("tcp", "::", 22)
++    assert parse_socketspec("udp://0.0.0.0:22") == ("udp", "0.0.0.0", 22)
++    assert parse_socketspec("unix://can:be.any/thing:22") == (
++        "unix", "can:be.any/thing:22", None)
++
++
++def test_socket(TestinfraBackend, Socket):
++    listening = Socket.get_listening_sockets()
++    for spec in (
++        "tcp://0.0.0.0:22",
++        "tcp://:::22",
++        "unix:///run/systemd/private",
++    ):
++        assert spec in listening
++    for spec in (
++        "tcp://22",
++        "tcp://0.0.0.0:22",
++        "tcp://127.0.0.1:22",
++        "tcp://:::22",
++        "tcp://::1:22",
++    ):
++        socket = Socket(spec)
++        assert socket.is_listening
++
++    assert not Socket("tcp://4242").is_listening
++
++    if not TestinfraBackend.get_connection_type() == "docker":
++        # FIXME
++        for spec in (
++            "tcp://22",
++            "tcp://0.0.0.0:22",
++        ):
++            assert len(Socket(spec).clients) >= 1
++
++
++@all_images
++def test_process(docker_image, Process):
++    init = Process.get(pid=1)
++    assert init.ppid == 0
++    assert init.euid == 0
++
++    args, comm = {
++        "debian_jessie": ("/sbin/init", "systemd"),
++        "centos_7": ("/usr/sbin/init", "systemd"),
++        "fedora": ("/usr/sbin/init", "systemd"),
++        "ubuntu_trusty": ("/usr/sbin/sshd -D", "sshd"),
++        "debian_wheezy": ("/usr/sbin/sshd -D", "sshd"),
++    }[docker_image]
++    assert init.args == args
++    assert init.comm == comm
++
++
++def test_user(User):
++    user = User("sshd")
++    assert user.exists
++    assert user.name == "sshd"
++    assert user.uid == 105
++    assert user.gid == 65534
++    assert user.group == "nogroup"
++    assert user.gids == [65534]
++    assert user.groups == ["nogroup"]
++    assert user.shell == "/usr/sbin/nologin"
++    assert user.home == "/var/run/sshd"
++    assert user.password == "*"
++
++
++def test_user_expiration_date(User):
++    assert User("root").expiration_date is None
++    assert User("user").expiration_date == datetime.datetime(2024, 10, 4, 0, 0)
++
++
++def test_nonexistent_user(User):
++    assert not User("zzzzzzzzzz").exists
++
++
++def test_current_user(User):
++    assert User().name == "root"
++    pw = User().password
++    assert crypt.crypt("foo", pw) == pw
++
++
++def test_group(Group):
++    assert Group("root").exists
++    assert Group("root").gid == 0
++
++
++def test_empty_command_output(Command):
++    assert Command.check_output("printf ''") == ""
++
++
++def test_local_command(LocalCommand):
++    assert LocalCommand.check_output("true") == ""
++
++
++def test_file(Command, SystemInfo, File):
++    Command.check_output("mkdir -p /d && printf foo > /d/f && chmod 600 /d/f")
++    d = File("/d")
++    assert d.is_directory
++    assert not d.is_file
++    f = File("/d/f")
++    assert f.exists
++    assert f.is_file
++    assert f.content == b"foo"
++    assert f.content_string == "foo"
++    assert f.user == "root"
++    assert f.uid == 0
++    assert f.gid == 0
++    assert f.group == "root"
++    assert f.mode == 0o600
++    assert f.contains("fo")
++    assert not f.is_directory
++    assert not f.is_symlink
++    assert not f.is_pipe
++    assert f.linked_to == "/d/f"
++    assert f.size == 3
++    assert f.md5sum == "acbd18db4cc2f85cedef654fccc4a4d8"
++    assert f.sha256sum == (
++        "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae"
++    )
++    Command.check_output("ln -fsn /d/f /d/l")
++    l = File("/d/l")
++    assert l.is_symlink
++    assert l.is_file
++    assert l.linked_to == "/d/f"
++
++    Command.check_output("rm -f /d/p && mkfifo /d/p")
++    assert File("/d/p").is_pipe
++
++
++def test_ansible_unavailable(Ansible):
++    with pytest.raises(RuntimeError) as excinfo:
++        Ansible("setup")
++    assert (
++        'Ansible module is only available with ansible '
++        'connection backend') in str(excinfo.value)
++
++
++@pytest.mark.testinfra_hosts("ansible://debian_jessie")
++def test_ansible_module(TestinfraBackend, Ansible):
++    import ansible
++    version = int(ansible.__version__.split(".", 1)[0])
++    setup = Ansible("setup")["ansible_facts"]
++    assert setup["ansible_lsb"]["codename"] == "jessie"
++    passwd = Ansible("file", "path=/etc/passwd state=file")
++    assert passwd["changed"] is False
++    assert passwd["gid"] == 0
++    assert passwd["group"] == "root"
++    assert passwd["mode"] == "0644"
++    assert passwd["owner"] == "root"
++    assert isinstance(passwd["size"], int)
++    assert passwd["path"] == "/etc/passwd"
++    assert passwd["state"] == "file"
++    assert passwd["uid"] == 0
++
++    variables = Ansible.get_variables()
++    assert variables["myvar"] == "foo"
++    assert variables["myhostvar"] == "bar"
++    assert variables["mygroupvar"] == "qux"
++    assert variables["inventory_hostname"] == "debian_jessie"
++    assert variables["group_names"] == ["testgroup"]
++
++    # test errors reporting
++    with pytest.raises(Ansible.AnsibleException) as excinfo:
++        Ansible("file", "path=/etc/passwd an_unexpected=variable")
++    tb = str(excinfo.value)
++    assert 'unsupported parameter for module: an_unexpected' in tb
++
++    with pytest.raises(Ansible.AnsibleException) as excinfo:
++        Ansible("command", "zzz")
++    if version == 1:
++        msg = "check mode not supported for command"
++    else:
++        msg = "Skipped. You might want to try check=False"
++    assert excinfo.value.result['msg'] == msg
++
++    try:
++        Ansible("command", "zzz", check=False)
++    except Ansible.AnsibleException as exc:
++        assert exc.result['rc'] == 2
++        assert exc.result['msg'] == '[Errno 2] No such file or directory'
++
++    result = Ansible("command", "echo foo", check=False)
++    assert result['stdout'] == 'foo'
++
++
++@pytest.mark.destructive
++def test_supervisor(Command, Service, Supervisor, Process):
++    # Wait supervisord is running
++    for _ in range(20):
++        if Service("supervisor").is_running:
++            break
++        time.sleep(.5)
++    else:
++        raise RuntimeError("No running supervisor")
++
++    for _ in range(20):
++        service = Supervisor("tail")
++        if service.status == "RUNNING":
++            break
++        else:
++            assert service.status == "STARTING"
++            time.sleep(.5)
++    else:
++        raise RuntimeError("No running tail in supervisor")
++
++    assert service.is_running
++    proc = Process.get(pid=service.pid)
++    assert proc.comm == "tail"
++
++    services = Supervisor.get_services()
++    assert len(services) == 1
++    assert services[0].name == "tail"
++    assert services[0].is_running
++    assert services[0].pid == service.pid
++
++    Command("supervisorctl stop tail")
++    service = Supervisor("tail")
++    assert not service.is_running
++    assert service.status == "STOPPED"
++    assert service.pid is None
++
++    Command("service supervisor stop")
++    assert not Service("supervisor").is_running
++    with pytest.raises(RuntimeError) as excinfo:
++        Supervisor("tail").is_running
++    assert 'Is supervisor running' in str(excinfo.value)
++
++
++def test_mountpoint(MountPoint):
++    root_mount = MountPoint('/')
++    assert root_mount.exists
++    assert isinstance(root_mount.options, list)
++    assert 'rw' in root_mount.options
++    assert root_mount.filesystem
++
++    fake_mount = MountPoint('/fake/mount')
++    assert not fake_mount.exists
++
++    mountpoints = MountPoint.get_mountpoints()
++    assert mountpoints
++    assert all(isinstance(m, MountPoint) for m in mountpoints)
++    assert len([m for m in mountpoints if m.path == "/"]) == 1
++
++
++def test_sudo_from_root(Sudo, User):
++    assert User().name == "root"
++    with Sudo("user"):
++        assert User().name == "user"
++    assert User().name == "root"
++
++
++@pytest.mark.testinfra_hosts("docker://user@debian_jessie")
++def test_sudo_to_root(Sudo, User):
++    assert User().name == "user"
++    with Sudo():
++        assert User().name == "root"
++        # Test nested sudo
++        with Sudo("www-data"):
++            assert User().name == "www-data"
++    assert User().name == "user"
+diff -Naurp new/testinfra/utils/ansible_roles.py old/testinfra/utils/ansible_roles.py
+--- new/testinfra/utils/ansible_roles.py	1969-12-31 18:00:00.000000000 -0600
++++ old/testinfra/utils/ansible_roles.py	2017-10-04 13:33:04.000000000 -0500
+@@ -0,0 +1,162 @@
++# coding: utf-8
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import logging
++import pprint
++import re
++import subprocess
++import yaml
++from testinfra.utils import markers
++
++logger = logging.getLogger("testinfra")
++
++
++def get_node_os():
++    """Run Ansible's setup module and gathers some specific values from output.
++
++    This is currently written for and expects to be run in the IaC
++    Jenkins pipeline. Returns those key value pairs as a dict. Currently
++    supported values are:
++
++    * family
++    * distribution_version
++    * distribution_major_version
++    * kernel
++
++    >>> get_node_os()
++    {'distribution_major_version': '6',
++     'distribution_version': '6.4',
++     'family': 'RedHat',
++     'kernel': '2.6.32-358.el6.x86_64'}
++    """
++
++    node_os_info = {
++        'family': None,
++        'distribution_version': None,
++        'distribution_major_version': None,
++        'kernel': None,
++    }
++
++    # get information about the node using Ansible's setup module
++    ansible_cmd = subprocess.Popen("ansible -m setup -i jenkins.inv all", stdout=subprocess.PIPE, shell=True)
++    std_out = ansible_cmd.communicate()[0]
++
++    rc = ansible_cmd.returncode
++    if ansible_cmd.returncode != 0:
++        raise RuntimeError('Unexpected return code from executing "ansible -m setup"; expected 0, recieved ' + str(rc) + '\n'
++                           'stdout: \n' + std_out)
++
++    for line in std_out.splitlines():
++        match_os_family = re.search(r'"ansible_os_family": "(.*)"', line)
++        if match_os_family:
++            node_os_info['family'] = match_os_family.groups()[0]
++
++        match_version = re.search(r'"ansible_distribution_version": "(.*)"', line)
++        if match_version:
++            node_os_info['distribution_version'] = match_version.groups()[0]
++
++        match_major_version = re.search(r'"ansible_distribution_major_version": "(.*)"', line)
++        if match_major_version:
++            node_os_info['distribution_major_version'] = match_major_version.groups()[0]
++
++        match_kernel = re.search(r'"ansible_kernel": "(.*)"', line)
++        if match_kernel:
++            node_os_info['kernel'] = match_kernel.groups()[0]
++
++    logger.debug("Gathered the following OS info:")
++    for line in pprint.pformat(node_os_info).splitlines():
++        logger.debug(line)
++
++    return node_os_info
++
++
++def get_role_vars(desired_role, roles_vars_file='tests/roles_vars.yml'):
++    """Get information about how a role is called.
++
++    Uses a file called 'roles_vars.yml' found in a playbook repo's 'tests/'
++    directory (by default) The file contains a yaml structure which instructs
++    Testinfra on how to test roles.
++
++    >>> get_role_vars('example_role')
++    [{example_var1: 'string1', example_var2: 'string2'}, {}]
++
++    tests/roles_vars.yml contents::
++
++        example_role:
++            - {
++                example_var1: 'string1',
++                example_var2: 'string2'
++             }
++            - {}     # using defaults
++
++    """
++
++    # default for all roles is to run exactly once (one array element) using default variables (empty dict)
++    role_default = [{}]
++
++    if roles_vars_file == 'tests/roles_vars.yml':
++        try:
++            roles_vars_file = file(roles_vars_file, 'r')
++        except IOError:
++            # could not find roles_vars_file
++            logger.info("Could not find roles_vars file [%s], assuming role [%s] called once with defaults", roles_vars_file, desired_role)
++            return role_default
++    else:
++        # if caller specified their own file, expect to find it
++        roles_vars_file = file(roles_vars_file, 'r')
++
++    yaml_contents = yaml.load(roles_vars_file)
++
++    if yaml_contents is None:
++        # empty yaml file
++        logger.info("roles_vars file [%s] found, but contains no yaml. Assuming role [%s] called once with defaults", roles_vars_file, desired_role)
++        return role_default
++    role_calls = yaml_contents.get(desired_role, role_default)
++    if role_calls is None:
++        # specified role in yaml, but no contents
++        logger.info("Role [%s] found in [%s], but contains no information regarding how its called. Assuming role called once with defaults", desired_role, roles_vars_file)
++        return role_default
++    logger.info("Role [%s] will be called %d time(s) using vars (empty dict is defaults): %s", desired_role, len(role_calls), role_calls if role_calls != role_default else "defaults")
++    return role_calls
++
++
++class RoleTest(object):
++    test_args = ""
++    name = ""
++    test_vars = []
++    _roles = {}
++    _processed = False
++
++    # TODO: Add support for marking calls as only for specific host
++    #pylint: disable=no-self-use
++    def pytest_generate_tests(self, metafunc):
++        # Save information about role test calls separately so that it persists during collection
++        if not metafunc.module.__name__ in RoleTest._roles:
++            RoleTest._roles[metafunc.module.__name__] = {
++                'test_vars': RoleTest.test_vars,
++                'test_args': RoleTest.test_args,
++                'name': RoleTest.name
++            }
++            RoleTest.test_args = ""
++            RoleTest.test_vars = []
++            RoleTest.name = ""
++            RoleTest._processed = False
++
++        if not RoleTest._processed:
++            role_calls = get_role_vars(RoleTest._roles[metafunc.module.__name__]['name'])
++            for i in range(0, len(role_calls)):
++                # mark appropriate calls with their group
++                if '_ansible_groups' in role_calls[i]:
++                    RoleTest._roles[metafunc.module.__name__]['test_vars'][i] = markers.ansible_groups(role_calls[i]['_ansible_groups'], RoleTest._roles[metafunc.module.__name__]['test_vars'][i])
++            RoleTest._processed = True
++        metafunc.parametrize(RoleTest._roles[metafunc.module.__name__]['test_args'], RoleTest._roles[metafunc.module.__name__]['test_vars'])
+diff -Naurp new/testinfra/utils/conversion.py old/testinfra/utils/conversion.py
+--- new/testinfra/utils/conversion.py	1969-12-31 18:00:00.000000000 -0600
++++ old/testinfra/utils/conversion.py	2017-10-04 13:33:04.000000000 -0500
+@@ -0,0 +1,57 @@
++# coding: utf-8
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++MB_TO_KB = float(1024)
++GB_TO_B = float(1024*1024*1024)
++GB_TO_KB = float(1024*1024)
++GHZ_TO_MHZ = float(1000)
++
++
++def mb_to_kb(num):
++    """Converts num from megabytes to kilobytes
++
++    >>> mb_to_kb(1)
++    1024.0
++    """
++
++    return num * MB_TO_KB
++
++
++def gb_to_b(num):
++    """Converts num from gigabytes to bytes
++
++    >>> gb_to_b(1)
++    1073741824.0
++    """
++
++    return num * GB_TO_B
++
++
++def gb_to_kb(num):
++    """Converts num from gigabytes to kilobytes
++
++    >>> gb_to_kb(1)
++    1048576.0
++    """
++
++    return num * GB_TO_KB
++
++
++def ghz_to_mhz(num):
++    """Converts num from gigahertz to megahertz
++
++    >>> ghz_to_mhz(1)
++    1000.0
++    """
++
++    return num * GHZ_TO_MHZ
+diff -Naurp new/testinfra/utils/spec_range.py old/testinfra/utils/spec_range.py
+--- new/testinfra/utils/spec_range.py	1969-12-31 18:00:00.000000000 -0600
++++ old/testinfra/utils/spec_range.py	2017-10-04 13:33:04.000000000 -0500
+@@ -0,0 +1,67 @@
++# coding: utf-8
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import logging
++
++logger = logging.getLogger("testinfra")
++tolerance_default = 0.03
++
++
++def is_around(num1, num2, tolerance=tolerance_default):
++    """Returns bool if num1 is within specified tolerance of num2
++
++    >>> is_around(20, 20.5)
++    True
++    >>> is_around(20, 20.7)
++    False
++    """
++
++    logger.debug("Comparing [%.1f] with [%.1f] using tolerance +-%.1f%%; " +
++                 "must be between [%.1f] and [%.1f]", num1, num2,
++                 tolerance*100, num2 * (1 - tolerance),
++                 num2 * (1 + tolerance))
++
++    return abs(num2 - num1) < (num2 * tolerance)
++
++
++def is_at_least_around(num1, num2, tolerance=tolerance_default):
++    """Returns bool if num1 is greater than specified tolerance of
++    num2
++
++    >>> is_at_least_around(25, 20)
++    True
++    >>> is_at_least_around(19, 20)
++    False
++    """
++
++    logger.debug("Comparing [%.1f] with [%.1f] using tolerance -%.1f%%; " +
++                 "must be greater than [%.1f]", num1, num2,
++                 tolerance*100, num2 * (1 - tolerance))
++
++    return num1 >= num2 * (1 - tolerance)
++
++
++def is_at_most_around(num1, num2, tolerance=tolerance_default):
++    """Returns bool if num1 is less than specified tolerance of num2
++
++    >>> is_at_most_around(15, 20)
++    True
++    >>> is_at_most_around(21, 20)
++    False
++    """
++
++    logger.debug("Comparing [%.1f] with [%.1f] using tolerance +%.1f%%; " +
++                 "must be less than [%.1f]", num1, num2,
++                 tolerance*100, num2 * (1 + tolerance))
++
++    return num1 <= num2 * (1 + tolerance)

@@ -1,0 +1,382 @@
+diff -Naurp new/testinfra/backend/__init__.py old/testinfra/backend/__init__.py
+--- new/testinfra/backend/__init__.py	2017-05-29 12:30:09.000000000 -0500
++++ old/testinfra/backend/__init__.py	2017-10-04 13:33:04.000000000 -0500
+@@ -11,11 +11,15 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+ from __future__ import unicode_literals
++from __future__ import absolute_import
+ 
+ import importlib
+ 
+ from six.moves import urllib
++from ansible.parsing.dataloader import DataLoader
++from ansible.vars.manager import VariableManager
++from ansible.inventory.manager import InventoryManager
+ 
+ BACKENDS = {
+     'local': 'testinfra.backend.local.LocalBackend',
+@@ -26,6 +35,7 @@ BACKENDS = {
+     'docker': 'testinfra.backend.docker.DockerBackend',
+     'ansible': 'testinfra.backend.ansible.AnsibleBackend',
+     'kubectl': 'testinfra.backend.kubectl.KubectlBackend',
++    'winrm': 'testinfra.backend.winrm.WinrmBackend',
+ }
+ 
+ 
+@@ -49,7 +59,7 @@ def parse_hostspec(hostspec):
+             kw["sudo"] = True
+         for key in (
+             "ssh_config", "ansible_inventory",
+-            "sudo_user",
++            "sudo_user", "winrm_config",
+         ):
+             if key in query:
+                 kw[key] = query.get(key)[0]
+@@ -80,6 +90,8 @@ def get_backends(hosts, **kwargs):
+             connection = "local"
+         elif host is not None and connection is None:
+             connection = "paramiko"
++        elif host is not None and connection == "auto":
++            connection = _determine_connection(host, **kw)
+         klass = get_backend_class(connection)
+         for name in klass.get_hosts(host, **kw):
+             if connection == "local":
+@@ -87,3 +99,44 @@ def get_backends(hosts, **kwargs):
+             else:
+                 backends.append(klass(name, **kw))
+     return backends
++
++
++def _determine_connection(host, **kw):
++    klass = get_backend_class('ssh')
++    if klass(host, **kw).run("echo ''").rc == 0:
++        return 'ssh'
++    klass = get_backend_class('winrm')
++    if klass(host, **kw).run("echo ''").rc == 0:
++        return 'winrm'
++    raise Exception('Unable to automatically determine connection type for: ' + host)
++
++
++def parse_ansible_inventory(ansible_inventory):
++    ansible_inventory_contents = {}
++
++    variable_manager = VariableManager()
++    loader = DataLoader()
++
++    # Ansible: load inventory
++    inventory = InventoryManager(
++        loader=loader,
++        sources=[ansible_inventory]
++    )
++
++    variable_manager = VariableManager(
++        loader=loader,
++        inventory=inventory
++    )
++
++    for host in inventory.get_hosts():
++        all_vars = dict(host.vars)
++        all_vars['user'] = host.vars.get('ansible_user')
++        all_vars['password'] = host.vars.get('ansible_ssh_pass')
++        all_vars['password'] = host.vars.get('ansible_password', all_vars['password'])
++        all_vars['port'] = host.vars.get('ansible_port')
++        all_vars['server_cert_validation'] = host.vars.get('server_cert_validation')
++        all_vars['ansible_groups'] = [str(group) for group in host.get_groups()]
++
++        ansible_inventory_contents[host.get_name()] = all_vars
++
++    return ansible_inventory_contents
+diff -Naurp new/testinfra/backend/ssh.py old/testinfra/backend/ssh.py
+--- new/testinfra/backend/ssh.py	2017-05-29 12:30:09.000000000 -0500
++++ old/testinfra/backend/ssh.py	2017-10-04 13:33:04.000000000 -0500
+@@ -11,10 +11,12 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+ from __future__ import unicode_literals
+ 
+ import base64
++import os
+ 
++from testinfra import backend
+ from testinfra.backend import base
+ 
+ 
+@@ -22,17 +29,70 @@ class SshBackend(base.BaseBackend):
+     """Run command through ssh command"""
+     NAME = "ssh"
+ 
+-    def __init__(self, hostspec, ssh_config=None, *args, **kwargs):
++    def __init__(self, hostspec, ssh_config=None, ansible_inventory=None, use_sshpass=False, sshpass_file=None, *args, **kwargs):
++        self.sshpass_file = None
+         self.host, self.user, self.port = self.parse_hostspec(hostspec)
++        # if user specificed ansible inventory file, get specs from there; otherwise use sshpass file
++        if ansible_inventory is not None:
++            ansible_inventory_contents = backend.parse_ansible_inventory(ansible_inventory)
++            self.user = ansible_inventory_contents[self.host]["user"]
++            self.password = ansible_inventory_contents[self.host]["password"]
++        elif sshpass_file is not None:
++            self.sshpass_file = sshpass_file
++        elif ansible_inventory_contents is None and sshpass_file is None and use_sshpass:
++            raise RuntimeError("When using sshpass, you must specify an ansible-inventory file or sshpass file")
+         self.ssh_config = ssh_config
++        self.use_sshpass = use_sshpass
+         super(SshBackend, self).__init__(self.host, *args, **kwargs)
+ 
+     def run(self, command, *args, **kwargs):
++        if self.use_sshpass:
++            return self.run_sshpass(self.get_command(command, *args))
+         return self.run_ssh(self.get_command(command, *args))
+ 
+     def run_ssh(self, command):
+         cmd = ["ssh"]
+         cmd_args = []
++
++        cmd.append("-o StrictHostKeyChecking=%s")
++        cmd_args.append("no")
++
++        if self.ssh_config:
++            cmd.append("-F %s")
++            cmd_args.append(self.ssh_config)
++        if self.user:
++            cmd.append("-o User=%s")
++            cmd_args.append(self.user)
++        if self.port:
++            cmd.append("-o Port=%s")
++            cmd_args.append(self.port)
++        cmd.append("%s %s")
++        cmd_args.extend([self.host, command])
++        out = self.run_local(
++            " ".join(cmd), *cmd_args)
++        out.command = self.encode(command)
++        return out
++
++    def run_sshpass(self, command):
++        sshpass_pipe = None
++
++        cmd = ["sshpass"]
++        cmd_args = []
++        # pass password through file or through pipe
++        if self.sshpass_file is not None:
++            cmd.append("-f %s")
++            cmd_args.append(self.sshpass_file)
++        else:
++            sshpass_pipe = os.pipe()
++            os.write(sshpass_pipe[1], self.password + "\n")
++            cmd.append("-d %s")
++            cmd_args.append(str(sshpass_pipe[0]))
++
++        cmd.append("ssh")
++
++        cmd.append("-o StrictHostKeyChecking=%s")
++        cmd_args.append("no")
++
+         if self.ssh_config:
+             cmd.append("-F %s")
+             cmd_args.append(self.ssh_config)
+@@ -47,6 +107,11 @@ class SshBackend(base.BaseBackend):
+         out = self.run_local(
+             " ".join(cmd), *cmd_args)
+         out.command = self.encode(command)
++
++        if sshpass_pipe is not None:
++            os.close(sshpass_pipe[0])
++            os.close(sshpass_pipe[1])
++
+         return out
+ 
+ 
+diff -Naurp new/testinfra/backend/winrm.py old/testinfra/backend/winrm.py
+--- new/testinfra/backend/winrm.py	1969-12-31 18:00:00.000000000 -0600
++++ old/testinfra/backend/winrm.py	2017-10-04 13:33:04.000000000 -0500
+@@ -0,0 +1,104 @@
++# coding: utf-8
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# pylint: disable=too-many-function-args
++
++from __future__ import unicode_literals
++from __future__ import absolute_import
++
++import json
++import logging
++
++from winrm.protocol import Protocol
++from six.moves import urllib
++
++from testinfra import backend
++from testinfra.backend import base
++
++logger = logging.getLogger("testinfra")
++
++
++class WinrmBackend(base.BaseBackend):
++    """Run commands using winrm"""
++    NAME = "winrm"
++
++    def __init__(self, hostspec, winrm_config=None, ansible_inventory=None, *args, **kwargs):
++        self.host, self.user, self.port = self.parse_hostspec(hostspec)
++        # if user specificed ansible inventory file, get specs from there
++        if ansible_inventory is not None:
++            ansible_inventory_contents = backend.parse_ansible_inventory(ansible_inventory)
++            self.user = ansible_inventory_contents[self.host]["user"]
++            self.password = ansible_inventory_contents[self.host]["password"]
++            self.server_cert_validation = ansible_inventory_contents[self.host]["server_cert_validation"]
++            self.port = ansible_inventory_contents[self.host]["port"]
++        elif ansible_inventory is None and winrm_config is None:
++            raise RuntimeError("When using winrm backend, you must specify winrm-config file or ansible-inventory file")
++        elif ansible_inventory is not None and winrm_config is not None:
++            raise RuntimeError("Please specify either winrm-config file or ansible-inventory file, not both")
++        self.winrm_config = winrm_config
++        super(WinrmBackend, self).__init__(self.host, *args, **kwargs)
++
++    def run(self, command, *args, **kwargs):
++        return self.run_winrm(self.get_command(command, *args))
++
++    def run_winrm(self, command):
++        config = {
++            "scheme": "https",
++            "path": "/wsman",
++            "transport": "ssl",
++            "server_cert_validation": "ignore",
++            "port": self.port,
++            "username": self.user,
++            "password": None,
++        }
++
++        if config["port"] is None:
++            config["port"] = 5986
++
++        # Get winrm config information or use ansible inventory and overwrite defaults
++        if self.winrm_config is not None:
++            with open(self.winrm_config, 'r') as f:
++                config.update(json.load(f))
++        else:
++            config.update({
++                "server_cert_validation": self.server_cert_validation,
++                "port": self.port,
++                "username": self.user,
++                "password": self.password,
++            })
++
++        # if using an account under a domain, change transport to "ntlm"
++        if "\\" in config["username"] or "@" in config["username"]:
++            config["transport"] = "ntlm"
++
++        # build endpoint
++        netloc = "%s:%s" % (self.host, str(config["port"]))
++        endpoint = urllib.parse.urlunsplit((config["scheme"], netloc, config["path"], "", ""))
++
++        protocol = Protocol(
++            endpoint=endpoint,
++            transport=config["transport"],
++            username=config["username"],
++            password=config["password"],
++            server_cert_validation=config["server_cert_validation"],
++        )
++
++        shell_id = protocol.open_shell(codepage=65001)
++        command_id = protocol.run_command(shell_id, command)
++        stdout, stderr, status_code = protocol.get_command_output(shell_id, command_id)
++
++        protocol.cleanup_command(shell_id, command_id)
++        protocol.close_shell(shell_id)
++
++        result = base.CommandResult(self, status_code, command, stdout, stderr)
++        logger.info("WINRM %s", result)
++        return result
+diff -Naurp new/testinfra/test/test_backends.py old/testinfra/test/test_backends.py
+--- new/testinfra/test/test_backends.py	1969-12-31 18:00:00.000000000 -0600
++++ old/testinfra/test/test_backends.py	2017-10-04 13:33:04.000000000 -0500
+@@ -0,0 +1,80 @@
++# coding: utf-8
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++from __future__ import unicode_literals
++import pytest
++
++BACKENDS = ("ssh", "safe-ssh", "docker", "paramiko", "ansible")
++HOSTS = [backend + "://debian_jessie" for backend in BACKENDS]
++USER_HOSTS = [backend + "://user@debian_jessie" for backend in BACKENDS]
++SUDO_HOSTS = [
++    backend + "://user@debian_jessie?sudo=True"
++    for backend in BACKENDS
++]
++SUDO_USER_HOSTS = [
++    backend + "://debian_jessie?sudo=True&sudo_user=user"
++    for backend in BACKENDS
++]
++
++
++@pytest.mark.testinfra_hosts(*(
++    HOSTS + USER_HOSTS + SUDO_HOSTS + SUDO_USER_HOSTS))
++def test_command(Command):
++    assert Command.check_output("true") == ""
++    # test that quotting is correct
++    assert Command("echo a b | grep -q %s", "a c").rc == 1
++
++
++@pytest.mark.testinfra_hosts(*HOSTS)
++def test_encoding(TestinfraBackend, Command):
++    if TestinfraBackend.get_connection_type() == "ansible":
++        pytest.skip("ansible handle encoding himself")
++
++    # jessie image is fr_FR@ISO-8859-15
++    cmd = Command("ls -l %s", "/é")
++    if TestinfraBackend.get_connection_type() == "docker":
++        # docker bug ?
++        assert cmd.stderr_bytes == (
++            b"ls: impossible d'acc\xe9der \xe0 /\xef\xbf\xbd: "
++            b"Aucun fichier ou dossier de ce type\n"
++        )
++    else:
++        assert cmd.stderr_bytes == (
++            b"ls: impossible d'acc\xe9der \xe0 /\xe9: "
++            b"Aucun fichier ou dossier de ce type\n"
++        )
++        assert cmd.stderr == (
++            "ls: impossible d'accéder à /é: "
++            "Aucun fichier ou dossier de ce type\n"
++        )
++
++
++@pytest.mark.testinfra_hosts(*(USER_HOSTS + SUDO_USER_HOSTS))
++def test_user_connection(User):
++    assert User().name == "user"
++
++
++@pytest.mark.testinfra_hosts(*SUDO_HOSTS)
++def test_sudo(User):
++    assert User().name == "root"
++
++
++@pytest.mark.testinfra_hosts("ansible://debian_jessie")
++def test_ansible_hosts_expand(TestinfraBackend):
++    from testinfra.backend.ansible import AnsibleBackend
++
++    def get_hosts(spec):
++        return AnsibleBackend.get_hosts(
++            spec, ansible_inventory=TestinfraBackend.ansible_inventory)
++    assert get_hosts(["all"]) == ["debian_jessie"]
++    assert get_hosts(["testgroup"]) == ["debian_jessie"]
++    assert get_hosts(["*ia*jess*"]) == ["debian_jessie"]

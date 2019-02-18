@@ -1,0 +1,666 @@
+diff -Naurp new/doc/source/api.rst old/doc/source/api.rst
+--- new/doc/source/api.rst	2017-05-29 12:30:09.000000000 -0500
++++ old/doc/source/api.rst	2017-10-04 13:33:04.000000000 -0500
+@@ -6,8 +6,8 @@ API
+ Connection API
+ ~~~~~~~~~~~~~~
+ 
+-You can use testinfra outside of pytest or you can dynamically get a
+-`host` and call fonction from modules::
++You can use testinfra outside of pytest or you can dynamically get a
++`host` and call function from modules::
+ 
+     >>> import testinfra
+     >>> host = testinfra.get_host("paramiko://root@server:2222", sudo=True)
+diff -Naurp new/doc/source/backends.rst old/doc/source/backends.rst
+--- new/doc/source/backends.rst	2017-05-29 12:30:09.000000000 -0500
++++ old/doc/source/backends.rst	2017-10-04 13:33:04.000000000 -0500
+@@ -51,6 +51,14 @@ This is a pure ssh backend using the ``s
+ 
+ The ssh backend also accept ``--ssh-config`` and ``--sudo`` parameters.
+ 
++Also, ssh backend supports sshpass, through the use of ``--use-sshpass`` and ``--sshpass-file``.
++``--use-sshpass`` will toggle the use of sshpass, and will expect either ``--sshpass-file`` be
++provided or ``--ansible-inventory`` provided. When ``--ansible-inventory`` is provided,
++``ansible_ssh_pass`` must be defined inside. ``--sshpass-file`` simply passes its value to the
++``-f`` command of sshpass. Examples::
++
++    $ testinfra --connection=ssh --hosts=server --use-sshpass --sshpass-file=passwd.txt
++    $ testinfra --connection=ssh --ansible-inventory=inv.txt --use-sshpass
+ 
+ salt
+ ~~~~
+@@ -82,12 +90,39 @@ The ansible backend use the `ansible pyt
+     $ testinfra --connection=ansible --hosts=host1,host2
+     $ testinfra --connection=ansible --hosts='web*'
+ 
+-You can use an alternative `inventory` with the ``--ansible-inventory`` option.
++You can use an alternative `inventory` with the ``--ansible-inventory`` option
+ 
+ Note: Ansible settings such as ``remote_user``, etc., may be configured by using Ansible's
+ `environment variables <http://docs.ansible.com/ansible/intro_configuration.html#environmental-configuration>`_.
+ 
+ 
++winrm
++~~~~~
++
++The winrm backend uses `pywinrm <https://pypi.python.org/pypi/pywinrm>`_. If not using
++``--ansible-inventory``, ``--winrm-config`` must be provided, which is in json. Example::
++
++    $ testinfra --connection=winrm --hosts=server --winrm-config=conf.json
++    $ testinfra --connection=winrm --ansible-inventory=inv.txt
++
++The file given to ``--winrm-config`` accepts the following values:
++
++* ``scheme``
++* ``path``
++* ``transport``
++* ``server_cert_validation``
++* ``port``
++* ``username``
++* ``password``
++
++Example::
++
++    {
++        "username": "user",
++        "password": "pass"
++    }
++
++
+ kubectl
+ ~~~~~~~
+ 
+diff -Naurp new/doc/source/developers_guide_advanced.rst old/doc/source/developers_guide_advanced.rst
+--- new/doc/source/developers_guide_advanced.rst	1969-12-31 18:00:00.000000000 -0600
++++ old/doc/source/developers_guide_advanced.rst	2017-10-04 13:33:04.000000000 -0500
+@@ -0,0 +1,250 @@
++Developer's Guide Advanced
++##########################
++
++Role Tests
++==========
++
++Role tests will test relevant tasks that the role performs. Otherwise,
++they follow the same rules set forth in :ref:`playbook-tests`. However, role tests are more
++complex than playbook tests. This is because playbooks can call roles
++multiple times, and often with different variables for each call. This
++additional complexity requires some boilerplate, along with an
++additional file, the ``roles_vars.yml`` file.
++
++Repo Structure
++--------------
++
++Tests will be located in a ``tests/`` directory at the root of a repo.
++
++::
++
++    <role_repo>/tests/<test_name>.py
++
++    <role_repo>
++    ├── __init__.py
++    └── tests
++        ├── __init__.py
++        ├── <test_name>.py
++        └── <test_name>.py
++
++Example:
++
++::
++
++    role-nb_test
++    ├── __init__.py
++    └── tests
++        ├── __init__.py
++        ├── redhat.py
++        └── windows.py
++
++``__init__.py`` Files
++^^^^^^^^^^^^^^^^^^^^^
++
++For role repositories, two ``__init__.py`` files must be created in
++order to have proper namespacing when Testinfra performs test
++collection. The files must be found in the following locations:
++
++-  root of the role repo
++-  inside the ``tests/`` directory of the role repo
++
++The contents of the files are:
++
++::
++
++    # This empty __init__.py file exists to solve namespacing issues when Testinfra
++    # collects tests within roles. Without this file, Testinfra would collect
++    # multiple test files with the same name, ex. 'redhat.py'. With this file,
++    # Testinfra will collect unique files, for example: 'example.tests.redhat.py'.
++
++Test File
++---------
++
++Example:
++
++.. code-block:: python
++   :linenos:
++
++    import pytest
++    from testinfra.utils import ansible_roles, markers, OS
++    from testinfra.utils.ansible_roles import RoleTest
++
++
++    @markers.valid_os(OS.REDHAT)
++    class TestRole_example(RoleTest):
++        RoleTest.name = 'example'
++        RoleTest.test_args = 'example_var_a,example_var_b'
++
++        # Get information about how the role is called, setup defaults
++        for call in ansible_roles.get_role_vars(RoleTest.name):
++            example_var_a = call.get('example_var_a', 'fake_cmd')
++            example_var_b = call.get('example_var_b', 'bye')
++
++            RoleTest.test_vars.append((example_var_a, example_var_b))
++
++        def test_some_fake_cmd(self, Command, example_var_a, example_var_b):
++            assert Command(example_var_a).stdout == example_var_b
++
++The structure of a role test differs from a playbook test. It will
++include common boilerplate required for skipping tests and
++accommodations for the ``roles_vars.yml`` file.
++
++Skipping test if not appropriate
++^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
++
++Consists on line #7 in the example above.
++
++Apply the ``valid_os()`` marker to each test function by using a class. Testinfra
++will mark test functions as only for a valid OS, otherwise it will skip that test
++if the machine under test is not of valid OS type.
++
++Using the ``roles_vars.yml`` file
++^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
++
++Consists of lines #9-17 in example above.
++
++``RoleTest``
++""""""""""""
++
++``RoleTest`` is a class meant to be inherited by class which test roles. It
++provides boilerplate to role tests so that they may be executed multiple times.
++It is responsible for ``parametrize``-ing each test function within the class.
++
++See `parametrize <http://doc.pytest.org/en/latest/example/parametrize.html>`__
++for more information.
++
++``RoleTest.name``
++"""""""""""""""""
++
++``RoleTest.name`` sets the name of the role being tested.
++
++``RoleTest.test_args``
++"""""""""""""""""""""""
++
++``RoleTest.test_args`` is comma separated list of the variable names which will
++be used in the parameterize decorator in ``RoleTest``.
++
++``RoleTest.test_vars``
++""""""""""""""""""""""
++
++``RoleTest.test_vars`` is a list of tuples that contains the variable's values
++being passed to the test function. In an IaC context, think of each list
++element as a call to the role. Each tuple will contain variable's values
++that are passed to the role in the playbook.
++
++for loop
++""""""""
++
++The for loop iterates through the different calls made to the role. This
++is done using ``ansible_roles.get_role_vars(RoleTest.name)``.
++``ansible_roles.get_role_vars(RoleTest.name)`` will (by default) look for a
++file called ``roles_vars.yml`` in the playbooks ``tests/`` directory.
++``roles_vars.yml`` contains information about how a role was called in the
++playbook.
++
++Inside for loop
++"""""""""""""""
++
++Inside the for loop, the expected variables are either assigned their
++defaults or assigned the value that is found in ``roles_vars.yml``.
++Finally, a tuple is built containing all variables and is appended to
++the ``RoleTest.test_vars`` list.
++
++Required Variables
++""""""""""""""""""
++
++If a variable is expected to be passed to a role, then the test should
++also expect it to be present in the ``roles_vars.yml`` file. This can be
++done by performing a simple check inside the for loop: if the variable
++is ``None``, ``raise UserWarning()``.
++
++.. code:: python
++
++    required_var = call.get("required_var")     # defaults to None if not found
++
++    if required_var is None:
++        raise UserWarning("Role test requires the following variable be passed:\n"
++                          "\trequired_var")
++
++Test Functions
++^^^^^^^^^^^^^^
++
++In the function definition, you must include all variables that have
++been defined in ``RoleTest.test_args`` as arguments to the function,
++even if you do not use them in the function. The parameterize decorator
++expects that all variables given to it are arguments for the test function.
++
++``roles_vars.yml`` File
++-----------------------
++
++.. code:: yaml
++
++    yum_repo:
++      - yum_repo_section: 'artifactory',
++        yum_repo_baseurl: 'http://nbartifactory.rmnus.sen.symantec.com:8081/artifactory/yum-local/6.4/redhat/x86_64/'
++
++    nb_test:
++      - {}    # using defaults
++
++    example:
++      - {}    # using defaults
++      - example_var_a: 'echo "hi"',
++        example_var_b: 'hi'
++
++The ``roles_vars.yml`` file is expected to be located in the ``tests/``
++directory of a playbook repo. It is a YAML data structure that contains
++information about which roles were called in a playbook, how many times
++those roles were called, and with what (if any) non-default variables.
++The information in this file should closely resemble the roles section
++of the playbook. The YAML structure **MUST** follow the format detailed
++below, as the boilerplate mentioned above expects the YAML structure to
++be in this specific format.
++
++-  At the topmost level, or root, of the YAML file, define names of
++   roles as *keys* of a map. Only one role name should be defined; there
++   should not be duplicate role names found in the file
++-  The value of each role name (the key of map) is a *sequence*
++-  Each *element* of the sequence (``-``) represents a call to the role.
++   The values of these elements are either:
++
++   -  An empty map (``{}``), which represents a call to the role without
++      any passed variables (in other words, a call to the role using
++      default variables)
++   -  Any type of YAML data structure. Commonly it will be key value
++      pairs, but complex data structures can be defined. The information
++      defined here will be used to override defaults defined in the role
++      test
++
++    **NOTE:** An empty map (``{}``) *MUST* be defined as a value for a
++    sequence element when a role is called without passing variables to
++    it
++
++Using the example ``roles_vars.yml`` file shown above:
++
++-  ``yum_repo`` is called once overwriting two default variables,
++   ``yum_repo_section`` and ``yum_repo_baseurl``
++-  ``nb_test`` is called once using default variables
++-  ``example`` is called twice (once using defaults, once with non-default
++   variables passed)
++
++``_ansible_groups``
++^^^^^^^^^^^^^^^^^^^
++
++A key ``_ansible_groups`` can be defined for a call which in the playbook
++was executed against a specific Ansible group. For example, if the role
++``yum_repo`` was applied to the Ansible group ``guests``, the roles_vars.yml
++file may look like:
++
++.. code:: yaml
++
++    yum_repo:
++      - _ansible_groups: 'guests',
++        yum_repo_section: 'artifactory',
++        yum_repo_baseurl: 'http://nbartifactory.rmnus.sen.symantec.com:8081/artifactory/yum-local/6.4/redhat/x86_64/'
++
++Writing Modules
++---------------
++
++Feel free to add any modules required to this repository. Any new code
++must follow the code style used by Testinfra source and **MUST** adhere
++to Testinfra's original license rules.
+diff -Naurp new/doc/source/developers_guide_basic.rst old/doc/source/developers_guide_basic.rst
+--- new/doc/source/developers_guide_basic.rst	1969-12-31 18:00:00.000000000 -0600
++++ old/doc/source/developers_guide_basic.rst	2017-10-04 13:33:04.000000000 -0500
+@@ -0,0 +1,187 @@
++Developer's Guide Basic
++=======================
++
++.. _playbook-tests:
++
++Playbook Tests
++--------------
++
++Testinfra tests are essentially simple functions defined at the top
++level of the file. Playbook tests will generally test for *hardware* and
++*operating system* specs (if applicable), and any *relevant tasks* that
++the playbook performs. Relevant tasks have permanent changes to the node
++and therefore should be tested. Non-relevant tasks, like deploying files
++that are eventually removed from the node, should not be tested.
++
++Playbook tests should not contain tests for changes made by roles,
++unless the role does not have its own Testinfra test. Things done by
++roles are tested within their respective tests.
++
++Repo Structure
++~~~~~~~~~~~~~~
++
++Tests will be located in a ``tests/`` directory at the root of a repo.
++
++::
++
++    <playbook_repo>/tests/<test_name>.py
++
++    <playbook_repo>
++    └── tests
++        └── <test_name>.py
++
++Example:
++
++::
++
++    playbook-test_basic_redhat_6.4
++    └── tests
++        └── redhat.py
++
++    playbook-test_medium_windows_2008r2
++    └── tests
++        └── windows.py
++
++    playbook-ESX60
++    └── tests
++        ├── esx.py
++        ├── esx_vm_windows.py
++        └── esx_vm_redhat.py
++
++Test File
++~~~~~~~~~
++
++Playbook tests consist of function definitions at the top level of the
++file. There are a couple function types, which are outlined below.
++
++Example:
++
++.. code:: python
++
++    def test_echo(Command):
++        assert Command("echo 'hi'").stdout == "hi"
++
++Function types
++~~~~~~~~~~~~~~
++
++Test Functions
++^^^^^^^^^^^^^^
++
++*Test* functions are functions defined in test files that Testinfra will
++collect and execute. Test function names **must** begin with ``test_``
++(Ex.: ``test_num_of_cpus``), so Testinfra knows which functions its
++going to collect.
++
++*Test* functions will consume a Testinfra module by having its name as
++an argument to the function definition. Then, the actual tests are
++performed using Python's build-in ``assert``. See `Python's
++docs <https://docs.python.org/2/reference/simple_stmts.html#the-assert-statement>`__
++or `pytest's docs <http://doc.pytest.org/en/latest/assert.html>`__ for
++usage on ``assert``.
++
++    **NOTE:** If a *test* function is defined as a method of a class, it
++    must also have ``self`` as an argument, in addition to the Testinfra
++    modules it consumes.
++
++Example:
++
++.. code:: python
++
++    def test_file_exists(File):
++        file = File("/path/to/file.txt")
++        assert file.exists
++
++Non-Test Functions
++^^^^^^^^^^^^^^^^^^
++
++*Non-test* functions are not collected by Testinfra. Commonly, these
++functions will take the form of *helper* functions, which can be used to
++make code readable. Since they do not begin with ``test_``, Testinfra
++will not collect and execute them. It is recommended that helper
++function names begin with ``_``.
++
++Example:
++
++.. code:: python
++
++    def _gb_to_kb(num):
++        return num * 1024 * 1024
++
++Logging
++~~~~~~~
++
++Our fork of Testinfra defines a logging format and log file location,
++which is in the current directory under the name ``log.txt``. Most
++logging is taken care of via Testinfra's modules, but test writers can
++use logging in their tests by including the following lines:
++
++.. code:: python
++
++    import logging
++
++    logger = logging.getLogger("testinfra")
++
++Example test file ``test.py``:
++
++.. code:: python
++
++    import logging
++
++    logger = logging.getLogger("testinfra")
++
++    logger.info("Begin testing...")
++
++    def test_file(File):
++        logger.debug("File exists: %s" % (File("/etc/redhat-release").exists))
++        assert File("/etc/redhat-release").exists
++
++produced the following ``log.txt`` file:
++
++::
++
++    11:23:27             test:3        INFO - Begin testing...
++    11:23:28             base:166      INFO - RUN CommandResult(command="ssh example_machine.rmnus.sen.symantec.com 'uname -s'", exit_status=0, stdout='Linux\n',  ...
++    11:23:29             base:166      INFO - RUN CommandResult(command="ssh example_machine.rmnus.sen.symantec.com 'lsb_release -a'", exit_status=0, stdout='LSB  ...
++    11:23:29             base:166      INFO - RUN CommandResult(command="ssh example_machine.rmnus.sen.symantec.com 'test -e /etc/redhat-release'", exit_status=0, ...
++    11:23:29             test:6       DEBUG - File exists: True
++    11:23:30             base:166      INFO - RUN CommandResult(command="ssh example_machine.rmnus.sen.symantec.com 'test -e /etc/redhat-release'", exit_status=0, ...
++
++Helpful Tips and Tricks
++-----------------------
++
++Skipping tests and groups of tests
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++In order to properly replicate and test what playbook tasks accomplish,
++it may be necessary to skip tests. This can be done using a pytest
++decorator. See http://doc.pytest.org/en/latest/skipping.html
++
++In most cases, tasks skip if they are not running on the correct type of
++machine and may use ``ansible_*`` variables. In order to have access to
++these variables, you can use a utility included in our fork of
++Testinfra, ``get_node_os()``. Read more about ``get_node_os()`` :meth:`here <testinfra.utils.ansible_roles.get_node_os>`.
++
++Skipping a single test function:
++
++.. code:: python
++
++    @pytest.mark.skipif(node_os['distribution_major_version'] != '7',
++                        reason='test only on RedHat 7')
++    def test_fake_service(Service):
++        fake_service = Service('fake')
++        assert fake_service.is_enabled
++
++Skipping a multiple test functions at once uses classes:
++
++.. code:: python
++
++    @pytest.mark.skipif(node_os['family'] != 'RedHat', reason='RedHat only test')
++    class TestServices:
++        def test_fake_service(self, Service):
++            fake_service = Service('fake')
++            assert fake_service.is_enabled
++
++        def test_another_fake_service(self, Service):
++            another_fake_service = Service('fake')
++            assert another_fake_service.is_enabled
++
+diff -Naurp new/doc/source/index.rst old/doc/source/index.rst
+--- new/doc/source/index.rst	2017-05-29 12:30:09.000000000 -0500
++++ old/doc/source/index.rst	2017-10-04 13:33:04.000000000 -0500
+@@ -1,5 +1,3 @@
+-.. include:: ../../README.rst
+-
+ Documentation
+ =============
+ 
+@@ -10,6 +8,9 @@ Documentation
+    invocation
+    Connection backends <backends>
+    modules
++   utilities
+    api
+    examples
+-   support
++   developers_guide_basic
++   developers_guide_advanced
++   style_best_practices_faq
+diff -Naurp new/doc/source/modules.rst old/doc/source/modules.rst
+--- new/doc/source/modules.rst	2017-05-29 12:30:09.000000000 -0500
++++ old/doc/source/modules.rst	2017-10-04 13:33:04.000000000 -0500
+@@ -91,6 +91,34 @@ host
+ 
+        :class:`testinfra.modules.user.User` class
+ 
++    .. attribute:: winenvironment
++
++       :class:`testinfra.modules.winenvironment.WinEnvironment` class
++
++    .. attribute:: winfile
++
++       :class:`testinfra.modules.winfile.WinFile` class
++
++    .. attribute:: winregistry
++
++       :class:`testinfra.modules.winregistry.WinRegistry` class
++
++    .. attribute:: winservice
++
++       :class:`testinfra.modules.winservice.WinService` class
++
++    .. attribute:: winuser
++
++       :class:`testinfra.modules.winuser.WinUser` class
++
++    .. attribute:: hardwareinfo
++
++       :class:`testinfra.modules.hardwareinfo.HardwareInfo` class
++
++    .. attribute:: fsinfo
++
++       :class:`testinfra.modules.fsinfo.FSInfo` class
++
+ 
+ 
+ 
+@@ -225,4 +253,52 @@ User
+    :exclude-members: get_module_class
+ 
+ 
++.. _my-added-modules:
++
++My Added Modules
++================
++
++WinEnvironment
++~~~~~~~~~~~~~~
++
++.. autoclass:: testinfra.modules.winenvironment.WinEnvironment(name, level)
++   :members:
++
++WinFile
++~~~~~~~
++
++.. autoclass:: testinfra.modules.winfile.WinFile(path)
++   :members:
++
++WinRegistry
++~~~~~~~~~~~
++
++.. autoclass:: testinfra.modules.winregistry.WinRegistry(registry_key, registry_value)
++   :members:
++
++WinService
++~~~~~~~~~~
++
++.. autoclass:: testinfra.modules.winservice.WinService(service_name)
++   :members:
++
++WinUser
++~~~~~~~
++
++.. autoclass:: testinfra.modules.winuser.WinUser(user)
++   :members:
++
++HardwareInfo
++~~~~~~~~~~~~
++
++.. autoclass:: testinfra.modules.hardwareinfo.HardwareInfo()
++   :members:
++
++FSInfo
++~~~~~~
++
++.. autoclass:: testinfra.modules.fsinfo.FSInfo()
++   :members:
++
+ .. _fixture: https://docs.pytest.org/en/latest/fixture.html#fixture
++
+diff -Naurp new/doc/source/utilities.rst old/doc/source/utilities.rst
+--- new/doc/source/utilities.rst	1969-12-31 18:00:00.000000000 -0600
++++ old/doc/source/utilities.rst	2017-10-04 13:33:04.000000000 -0500
+@@ -0,0 +1,33 @@
++.. _utilities:
++
++Utilities
++=========
++
++We have provided some utilities that make using Testinfra in an IaC context easier.
++
++Ansible Roles
++~~~~~~~~~~~~~
++
++.. autofunction:: testinfra.utils.ansible_roles.get_node_os()
++
++.. autofunction:: testinfra.utils.ansible_roles.get_role_vars(desired_role, roles_vars_file)
++
++Conversion
++~~~~~~~~~~
++
++.. autofunction:: testinfra.utils.conversion.gb_to_b(num)
++
++.. autofunction:: testinfra.utils.conversion.gb_to_kb(num)
++
++.. autofunction:: testinfra.utils.conversion.mb_to_kb(num)
++
++.. autofunction:: testinfra.utils.conversion.ghz_to_mhz(num)
++
++Spec Range
++~~~~~~~~~~
++
++.. autofunction:: testinfra.utils.spec_range.is_around(num1, num2, tolerance)
++
++.. autofunction:: testinfra.utils.spec_range.is_at_least_around(num1, num2, tolerance)
++
++.. autofunction:: testinfra.utils.spec_range.is_at_most_around(num1, num2, tolerance)

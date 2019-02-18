@@ -1,0 +1,344 @@
+diff -Naurp new/testinfra/modules/file.py old/testinfra/modules/file.py
+--- new/testinfra/modules/file.py	2017-05-29 12:30:09.000000000 -0500
++++ old/testinfra/modules/file.py	2017-10-04 13:33:04.000000000 -0500
+@@ -11,6 +11,6 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+ from __future__ import unicode_literals
+ 
+ import datetime
+@@ -175,6 +180,8 @@ class File(Module):
+     def get_module_class(cls, host):
+         if host.system_info.type == "linux":
+             return GNUFile
++        elif host.system_info.type == "sunos":
++            return SunOSFile
+         elif host.system_info.type == "netbsd":
+             return NetBSDFile
+         elif (host.system_info.type.endswith("bsd")
+@@ -226,6 +233,64 @@ class GNUFile(File):
+             "sha256sum %s | cut -d ' ' -f 1", self.path)
+ 
+ 
++class SunOSFile(File):
++    @property
++    def user(self):
++        return self.check_output("ls -ld %s | awk '{print $3}'", self.path)
++
++    @property
++    def uid(self):
++        return self.check_output("ls -nd %s | awk '{print $3}'", self.path)
++
++    @property
++    def group(self):
++        return self.check_output("ls -ld %s | awk '{print $4}'", self.path)
++
++    @property
++    def gid(self):
++        return self.check_output("ls -nd %s | awk '{print $4}'", self.path)
++
++    @property
++    def mode(self):
++        # Supply a base of 8 when parsing an octal integer
++        # e.g. int('644', 8) -> 420
++        return int(self.check_output("ls -ld %s | sed -e 's/--x/1/g' -e 's/-w-/2/g' -e 's/-wx/3/g' -e 's/r--/4/g'  -e 's/r-x/5/g' -e 's/rw-/6/g' -e 's/rwx/7/g' -e 's/---/0/g' | awk '{print $1}' | cut -c 2-4", self.path), 8)
++
++    def contains(self, pattern):
++        return self.run_test("/usr/xpg4/bin/grep -q -s %s %s", pattern, self.path).rc == 0
++
++    @property
++    def mtime(self):
++        day = self.check_output("ls -Ed %s | awk '{print $6}'", self.path)
++        time = self.check_output("ls -Ed %s | awk '{print $7}' | cut -d '.' -f 1", self.path)
++        return day + " " + time
++
++    @property
++    def size(self):
++        return int(self.check_output("ls -ld %s | awk '{print $5}'", self.path))
++
++    @property
++    def md5sum(self):
++        return self.check_output("digest -a md5  %s | awk '{print $1}'", self.path)
++
++    @property
++    def sha256sum(self):
++        return self.check_output("digest -a sha256 %s | awk '{print $1}'", self.path)
++
++    @property
++    def cksum(self):
++        return self.check_output("cksum %s | awk '{print $1}'", self.path)
++
++    @property
++    def linked_to(self):
++        """Resolve symlink
++
++        >>> host.file("/var/lock").linked_to
++        '/run/lock'
++        """
++        return self.check_output("ls -ld %s | awk '{print $11}'", self.path)
++
++
+ class BSDFile(File):
+     @property
+     def user(self):
+diff -Naurp new/testinfra/modules/interface.py old/testinfra/modules/interface.py
+--- new/testinfra/modules/interface.py	2017-05-29 12:30:09.000000000 -0500
++++ old/testinfra/modules/interface.py	2017-10-04 13:33:04.000000000 -0500
+@@ -11,6 +11,6 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+ from __future__ import unicode_literals
+ 
+ from testinfra.modules.base import Module
+@@ -47,6 +52,8 @@ class Interface(Module):
+     def get_module_class(cls, host):
+         if host.system_info.type == "linux":
+             return LinuxInterface
++        elif host.system_info.type == "sunos":
++            return SunOSInterface
+         elif host.system_info.type.endswith("bsd"):
+             return BSDInterface
+         else:
+@@ -70,6 +77,34 @@ class LinuxInterface(Interface):
+         addrs = []
+         for line in stdout.splitlines():
+             splitted = [e.strip() for e in line.split(" ") if e]
++            if splitted and splitted[0] in ("inet", "inet6"):
++                addrs.append(splitted[1].split("/", 1)[0])
++        return addrs
++
++
++class SunOSInterface(Interface):
++
++    @property
++    def exists(self):
++        return self.run_test("ifconfig %s", self.name).rc == 0
++
++    @property
++    def speed(self):
++        if self._host.system_info.release.startswith("10"):
++            stdout = self.check_output("dladm show-dev -p %s", self.name)
++            splitted = [e.strip() for e in stdout.split(" ") if e]
++            for prop in splitted:
++                if prop.startswith("speed"):
++                    return int(prop.split("=")[-1])
++        elif self._host.system_info.release.startswith("11"):
++            return int(self.check_output("dladm show-phys -p -o SPEED %s", self.name))
++
++    @property
++    def addresses(self):
++        stdout = self.check_output("ifconfig %s", self.name)
++        addrs = []
++        for line in stdout.splitlines():
++            splitted = [e.strip() for e in line.split(" ") if e]
+             if splitted and splitted[0] in ("inet", "inet6"):
+                 addrs.append(splitted[1].split("/", 1)[0])
+         return addrs
+diff -Naurp new/testinfra/modules/mountpoint.py old/testinfra/modules/mountpoint.py
+--- new/testinfra/modules/mountpoint.py	2017-05-29 12:30:09.000000000 -0500
++++ old/testinfra/modules/mountpoint.py	2017-10-04 13:33:04.000000000 -0500
+@@ -11,6 +11,6 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+ from __future__ import unicode_literals
+ 
+ from testinfra.modules.base import Module
+@@ -99,6 +104,8 @@ class MountPoint(Module):
+     def get_module_class(cls, host):
+         if host.system_info.type == "linux":
+             return LinuxMountPoint
++        elif host.system_info.type == "sunos":
++            return SunOSMountPoint
+         elif host.system_info.type.endswith("bsd"):
+             return BSDMountPoint
+         else:
+@@ -138,6 +145,22 @@ class LinuxMountPoint(MountPoint):
+             }
+ 
+ 
++class SunOSMountPoint(MountPoint):
++
++    @classmethod
++    def _iter_mountpoints(cls):
++        check_output = cls(None).check_output
++        for line in check_output("mount -v").splitlines():
++            splitted = line.split()
++
++            yield {
++                "path": splitted[2],
++                "device": splitted[0],
++                "filesystem": splitted[4],
++                "options": splitted[5].split("/"),
++            }
++
++
+ class BSDMountPoint(MountPoint):
+ 
+     @classmethod
+diff -Naurp new/testinfra/modules/package.py old/testinfra/modules/package.py
+--- new/testinfra/modules/package.py	2017-05-29 12:30:09.000000000 -0500
++++ old/testinfra/modules/package.py	2017-10-04 13:33:04.000000000 -0500
+@@ -11,6 +11,6 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+ from __future__ import unicode_literals
+ 
+ from testinfra.modules.base import Module
+@@ -37,6 +42,7 @@ class Package(Module):
+         - pkg_info (OpenBSD)
+         - pkg_info (NetBSD)
+         - pkg (FreeBSD)
++        - pkginfo (SunOS)
+         """
+         raise NotImplementedError
+ 
+@@ -67,6 +73,8 @@ class Package(Module):
+             return FreeBSDPackage
+         elif host.system_info.type in ("openbsd", "netbsd"):
+             return OpenBSDPackage
++        elif host.system_info.type == "sunos":
++            return SunOSPackage
+         elif host.exists("dpkg-query"):
+             return DebianPackage
+         elif host.exists("rpm"):
+@@ -96,6 +104,26 @@ class DebianPackage(Package):
+             return out[3]
+ 
+ 
++class SunOSPackage(Package):
++
++    @property
++    def is_installed(self):
++        return self.run_expect([0, 1], "pkginfo %s", self.name).rc == 0
++
++    @property
++    def release(self):
++        raise NotImplementedError
++
++    @property
++    def version(self):
++        out = self.check_output("pkgparam %s VERSION", self.name)
++
++        # bash-3.2# pkgparam SUNWgzip VERSION
++        # 11.10.0,REV=2005.01.08.01.09
++
++        return out.split(",")[0].strip()
++
++
+ class FreeBSDPackage(Package):
+ 
+     @property
+diff -Naurp new/testinfra/modules/process.py old/testinfra/modules/process.py
+--- new/testinfra/modules/process.py	2017-05-29 12:30:09.000000000 -0500
++++ old/testinfra/modules/process.py	2017-10-04 13:33:04.000000000 -0500
+@@ -11,6 +11,6 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+ from __future__ import unicode_literals
+ 
+ import six
+@@ -113,6 +118,8 @@ class Process(InstanceModule):
+         if (host.system_info.type == "linux"
+                 or host.system_info.type.endswith("bsd")):
+             return PosixProcess
++        elif host.system_info.type == "sunos":
++            return SunOSProcess
+         else:
+             raise NotImplementedError
+ 
+@@ -154,3 +161,38 @@ class PosixProcess(Process):
+             "lstart": " ".join(splitted[:5]),
+             name: int_or_float(splitted[5]),
+         }
++
++
++class SunOSProcess(Process):
++
++    def _get_processes(self, **filters):
++        cmd = "ps -A -o %s"
++        attributes = set(["pid", "comm", "pcpu", "pmem"]) | set(filters.keys())
++
++        # Theses attributes contains spaces. Put them at the end of the list
++        attributes -= set(["stime", "args"])
++        attributes = sorted(attributes)
++        attributes.extend(["stime", "args"])
++        arg = ",".join(attributes)
++
++        procs = []
++        # skip first line (header)
++        for line in self.check_output(cmd, arg).splitlines()[1:]:
++            splitted = line.split()
++            attrs = {}
++            i = 0
++            for i, key in enumerate(attributes[:-2]):
++                attrs[key] = int_or_float(splitted[i])
++            attrs["lstart"] = " ".join(splitted[i+1])
++            attrs["args"] = " ".join(splitted[i:])
++            procs.append(attrs)
++        return procs
++
++    def _get_process_attribute_by_pid(self, pid, name):
++        out = self.check_output(
++            "ps -p %s -o stime,%s", six.text_type(pid), name)
++        splitted = out.splitlines()[1].split()
++        return {
++            "lstart": " ".join(splitted[0]),
++            name: int_or_float(splitted[1]),
++        }
+diff -Naurp new/testinfra/modules/service.py old/testinfra/modules/service.py
+--- new/testinfra/modules/service.py	2017-05-29 12:30:09.000000000 -0500
++++ old/testinfra/modules/service.py	2017-10-04 13:33:04.000000000 -0500
+@@ -11,6 +11,6 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+ from __future__ import unicode_literals
+ 
+ from testinfra.modules.base import Module
+@@ -27,6 +32,7 @@ class Service(Module):
+       (``is_enabled`` is not yet implemented)
+     - NetBSD: ``/etc/rc.d/$name onestatus`` for ``is_running``
+       (``is_enabled`` is not yet implemented)
++    - SunOS: Using Service Management Facility(SMF)
+ 
+     """
+ 
+@@ -46,6 +52,7 @@ class Service(Module):
+ 
+     @classmethod
+     def get_module_class(cls, host):
++        # pylint: disable=too-many-return-statements
+         if host.system_info.type == "linux":
+             if (
+                 host.exists("systemctl")
+@@ -61,6 +68,8 @@ class Service(Module):
+             return OpenBSDService
+         elif host.system_info.type == "netbsd":
+             return NetBSDService
++        elif host.system_info.type == "sunos":
++            return SunOSService
+         raise NotImplementedError
+ 
+     def __repr__(self):
+@@ -166,3 +175,16 @@ class NetBSDService(Service):
+     @property
+     def is_enabled(self):
+         raise NotImplementedError
++
++
++class SunOSService(Service):
++
++    @property
++    def is_running(self):
++        running_states = ["online", "degraded", "legacy_run"]
++        return self.check_output("svcs -H -o STATE %s" % (self.name)) in running_states
++
++    @property
++    def is_enabled(self):
++        enabled_states = ["offline", "online", "maintenance", "degraded", "legacy_run"]
++        return self.check_output("svcs -H -o STATE %s" % (self.name)) in enabled_states

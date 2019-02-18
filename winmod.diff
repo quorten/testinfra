@@ -1,0 +1,344 @@
+diff -Naurp new/testinfra/modules/winenvironment.py old/testinfra/modules/winenvironment.py
+--- new/testinfra/modules/winenvironment.py	1969-12-31 18:00:00.000000000 -0600
++++ old/testinfra/modules/winenvironment.py	2017-10-04 13:33:04.000000000 -0500
+@@ -0,0 +1,32 @@
++# coding: utf-8
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from testinfra.modules.base import Module
++
++
++class WinEnvironment(Module):
++    """Get Windows environment values"""
++
++    def __init__(self, name, level):
++        self.name = name
++        self.level = level
++        super(WinEnvironment, self).__init__()
++
++    @property
++    def value(self):
++        """Get string value of environment variable 'name'
++
++        >>> host.win_environment(name="foo", level="machine").value
++        bar
++        """
++        return self.check_output("powershell -Command \"[Environment]::GetEnvironmentVariable('%s', '%s')\"" % (self.name, self.level)).strip()
+diff -Naurp new/testinfra/modules/winfile.py old/testinfra/modules/winfile.py
+--- new/testinfra/modules/winfile.py	1969-12-31 18:00:00.000000000 -0600
++++ old/testinfra/modules/winfile.py	2017-10-04 13:33:04.000000000 -0500
+@@ -0,0 +1,65 @@
++# coding: utf-8
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from testinfra.modules.base import Module
++
++
++class WinFile(Module):
++    """Provides information about files for Windows systems"""
++
++    def __init__(self, path):
++        self.path = path
++        super(WinFile, self).__init__()
++
++    @property
++    def exists(self):
++        """Test if file or directory exists
++
++        >>> host.win_file("C:\\exists").exists
++        True
++        >>> host.win_file("C:\\does_not_exist").exists
++        False
++        """
++        return self.run_test("dir \"%s\"" % (self.path)).rc == 0
++
++    @property
++    def is_file(self):
++        """Test if file
++
++        >>> host.win_file("C:\\file.txt").is_file
++        True
++        >>> host.win_file("C:\\dir").is_file
++        False
++        """
++        return self.run_test("dir \"%s\" /A:-D" % (self.path)).rc == 0
++
++    @property
++    def is_directory(self):
++        """Test if directory
++
++        >>> host.win_file("C:\\dir").is_directory
++        True
++        >>> host.win_file("C:\\file.txt").is_directory
++        False
++        """
++        return self.run_test("dir \"%s\" /A:D" % (self.path)).rc == 0
++
++    def contains(self, string):
++        """Test if file contains string, doesn't support regex
++
++        >>> host.win_file("C:\\file").contains("foo")
++        True
++        >>> host.win_file("C:\\file").contains("foo")
++        False
++        """
++        return string in self.run_test("powershell -c \"cat \"%s\"\"" % (self.path)).stdout
+diff -Naurp new/testinfra/modules/winregistry.py old/testinfra/modules/winregistry.py
+--- new/testinfra/modules/winregistry.py	1969-12-31 18:00:00.000000000 -0600
++++ old/testinfra/modules/winregistry.py	2017-10-04 13:33:04.000000000 -0500
+@@ -0,0 +1,85 @@
++# coding: utf-8
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import logging
++import re
++
++from testinfra.modules.base import Module
++
++logger = logging.getLogger("testinfra")
++
++
++class WinRegistry(Module):
++    """Provides information about registry for Windows systems"""
++
++    def __init__(self, registry_key, registry_value):
++        self.registry_key = registry_key
++        self.registry_value = registry_value
++        super(WinRegistry, self).__init__()
++
++    def _get_key_data(self, get_raw=False):
++        std_out = self.check_output("reg query \"%s\" /v %s" % (self.registry_key, self.registry_value)).replace("\r\r\n", "\n").strip()
++
++        for line in std_out.splitlines():
++            match = re.search(r"\s+\S+\s+(\S+)\s+(.*)$", line)
++
++            if match:
++                registry_data = None
++                registry_data_type = match.groups()[0]
++                registry_data_raw = match.groups()[1]
++
++                logger.debug("Found Windows registry info:")
++                logger.debug("    Key: %s", self.registry_key)
++                logger.debug("    Value: %s", self.registry_value)
++                logger.debug("    Data type: %s", registry_data_type)
++                logger.debug("    Data (raw): %s", registry_data_raw)
++
++                if get_raw:
++                    return registry_data_raw
++
++                # 32-bit number
++                if registry_data_type == 'REG_DWORD':
++                    registry_data = int(registry_data_raw, 16)
++                    logger.debug("    Data: %d", registry_data)
++                    return registry_data
++
++                # null-terminated string
++                elif registry_data_type == 'REG_SZ' or registry_data_type == 'REG_EXPAND_SZ':
++                    return registry_data_raw
++
++                else:
++                    # TODO: Add conversion for:
++                    #       REG_BINARY, REG_MULTI_SZ, REG_QWORD
++                    raise NotImplementedError("Value not implemented: %s" % (registry_data_type))
++
++        # If we get to this point, we didn't find the key
++        raise UserWarning("Registry key not found: %s" % (self.registry_key))
++
++    @property
++    def get_data(self):
++        """Returns data for registry_key as data's actual type
++        (ex. int, str)
++
++        >>> host.win_registry('HKLM\\SYSTEM\\Some\\Fake\\REG_DWORD_Key', 'SomeValue').get_data
++        0
++        """
++        return self._get_key_data()
++
++    @property
++    def get_data_raw(self):
++        """Returns data for registry_key in raw form as string
++
++        >>> host.win_registry('HKLM\\SYSTEM\\Some\\Fake\\REG_DWORD_Key', 'SomeValue').get_data_raw
++        '0x0'
++        """
++        return self._get_key_data(get_raw=True)
+diff -Naurp new/testinfra/modules/winservice.py old/testinfra/modules/winservice.py
+--- new/testinfra/modules/winservice.py	1969-12-31 18:00:00.000000000 -0600
++++ old/testinfra/modules/winservice.py	2017-10-04 13:33:04.000000000 -0500
+@@ -0,0 +1,51 @@
++# coding: utf-8
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import logging
++import pprint
++
++from testinfra.modules.base import Module
++
++logger = logging.getLogger("testinfra")
++
++
++class WinService(Module):
++    """Provides information about services for Windows systems"""
++
++    def __init__(self, service_name):
++        self.service_name = service_name
++        super(WinService, self).__init__()
++
++    def _get_service_info(self):
++        service_info = {}
++
++        std_out = self.check_output("wmic service where Name='%s' get /value" % (self.service_name)).replace("\r\r\n", "\n").strip()
++
++        for line in std_out.splitlines():
++            key, value = line.split('=', 1)
++            service_info[key.lower()] = value
++
++        logger.debug("Created dict with service info:")
++        for line in pprint.pformat(service_info).splitlines():
++            logger.debug(line)
++
++        return service_info
++
++    @property
++    def get_dict(self):
++        """Returns a dict containing information about service_name
++
++        >>> host.win_service('w32time').get_dict['state']
++        'Stopped'
++        """
++        return self._get_service_info()
+diff -Naurp new/testinfra/modules/winuser.py old/testinfra/modules/winuser.py
+--- new/testinfra/modules/winuser.py	1969-12-31 18:00:00.000000000 -0600
++++ old/testinfra/modules/winuser.py	2017-10-04 13:33:04.000000000 -0500
+@@ -0,0 +1,91 @@
++# coding: utf-8
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import re
++from testinfra.modules.base import Module
++
++
++class WinUser(Module):
++    """Provides information about users for Windows systems"""
++
++    def __init__(self, user):
++        self.user = user
++        self.domain = None
++        self.username = None
++        if '\\' in self.user:
++            self.domain, self.username = self.user.split('\\')
++        super(WinUser, self).__init__()
++
++    def is_local(self):
++        """Test if user is local
++
++        >>> host.win_user("Administrator").is_local
++        True
++        >>> host.win_user("DOMAIN\\user").is_local
++        False
++        """
++        return self.run_test("net user %s" % (self.user)).rc == 0
++
++    def is_administrator(self):
++        """Test if user has administrator rights
++
++        >>> host.win_user("Administrator").is_administrator
++        True
++        >>> host.win_user("nonadmin").is_administrator
++        False
++        """
++        search = False
++        std_out = self.check_output("net localgroup Administrators")
++        for line in std_out.splitlines():
++            if "Members" in line:
++                search = True
++
++            if search:
++                if self.user in line:
++                    return True
++
++        return False
++
++    @property
++    def groups(self):
++        """Returns list of groups user belongs to
++
++        >>> host.win_user("Administrator").groups
++        [u'Administrators', u'Users']
++        """
++        groups = []
++
++        stdout = self.check_output("wmic path win32_groupuser get /value")
++        stdout = stdout.replace("\r\r\n", "\n").strip()
++
++        for block in stdout.split("\n\n\n"):
++            group = None
++            username = None
++            domain = None
++            for line in block.splitlines():
++                if "GroupComponent" in line:
++                    found = re.search(r"Name=\"(.*?)\"", line)
++                    if found:
++                        group = found.group(1)
++                elif "PartComponent" in line:
++                    found = re.search(r"Name=\"(.*?)\"", line)
++                    if found:
++                        username = found.group(1)
++                    found = re.search(r"Domain=\"(.*?)\"", line)
++                    if found:
++                        domain = found.group(1)
++
++            if username == self.user or (username == self.username and domain == self.domain):
++                groups.append(group)
++
++        return groups

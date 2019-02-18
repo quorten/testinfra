@@ -1,0 +1,212 @@
+diff -Naurp new/testinfra/modules/systeminfo.py old/testinfra/modules/systeminfo.py
+--- new/testinfra/modules/systeminfo.py	2017-05-29 12:30:09.000000000 -0500
++++ old/testinfra/modules/systeminfo.py	2017-10-04 13:33:04.000000000 -0500
+@@ -11,11 +11,16 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+ from __future__ import unicode_literals
+ 
++import logging
++import pprint
+ import re
+ 
+ from testinfra.modules.base import InstanceModule
++from testinfra import utils
++
++logger = logging.getLogger("testinfra")
+ 
+ 
+ class SystemInfo(InstanceModule):
+@@ -47,6 +57,9 @@ class SystemInfo(InstanceModule):
+                     sysinfo["release"] = value
+                 elif key == "codename":
+                     sysinfo["codename"] = value
++            uname_p = self.run("uname -p")
++            if uname_p.rc == 0:
++                sysinfo["architecture"] = uname_p.stdout.strip()
+             return sysinfo
+ 
+         # https://www.freedesktop.org/software/systemd/man/os-release.html
+@@ -62,6 +75,9 @@ class SystemInfo(InstanceModule):
+                         sysinfo[attname] = (
+                             line[len(key):].replace('"', "").
+                             replace("'", "").strip())
++            uname_p = self.run("uname -p")
++            if uname_p.rc == 0:
++                sysinfo["architecture"] = uname_p.stdout.strip()
+             return sysinfo
+ 
+         # RedHat / CentOS 6 haven't /etc/os-release
+@@ -73,7 +89,57 @@ class SystemInfo(InstanceModule):
+             if match:
+                 sysinfo["distribution"], sysinfo["release"] = (
+                     match.groups())
+-                return sysinfo
++            uname_p = self.run("uname -p")
++            if uname_p.rc == 0:
++                sysinfo["architecture"] = uname_p.stdout.strip()
++            return sysinfo
++
++        return sysinfo
++
++    #  Solaris_x86, Solaris (SPARC)
++    def _get_solaris_sysinfo(self):
++        sysinfo = {}
++
++        release = self.run("cat /etc/release")
++        if release.rc == 0:
++
++            # Only interested in first line
++            first_line = release.stdout.splitlines()[0].strip()
++            match = re.search(r".+?(?=\d)(.+?(?=[a-zA-Z]))", first_line)
++
++            if match:
++                sysinfo["type"] = "sunos"
++                sysinfo["distribution"] = "solaris"
++                sysinfo["release"] = match.groups()[0].strip()
++                arch_match = re.search(r"[ ](?=[^ ]*$)(\w+)", first_line)
++                if arch_match:
++                    sysinfo["architecture"] = arch_match.groups()[0].lower()
++        return sysinfo
++
++    #  Windows
++    def _get_windows_sysinfo(self):
++        sysinfo = {}
++
++        wmic = self.run("wmic os get Caption,OSArchitecture,Version /value")
++
++        if wmic.rc == 0:
++            detail = {}
++
++            # Replace Windows line endings and remove excess whitespace
++            std_out = wmic.stdout.replace("\r\r\n", "\n").strip()
++
++            for line in std_out.splitlines():
++                key, value = line.split("=")
++                detail[key] = value
++
++            sysinfo["architecture"] = detail["OSArchitecture"].lower()
++            sysinfo["win_version"] = detail["Version"]
++
++            match = re.search(r"Microsoft Windows (.+)$", detail["Caption"])
++
++            if match:
++                sysinfo["type"] = "windows"
++                sysinfo["release"] = match.groups()[0].lower().strip()
+ 
+         return sysinfo
+ 
+@@ -99,17 +165,39 @@ class SystemInfo(InstanceModule):
+             "distribution": None,
+             "codename": None,
+             "release": None,
++            "release_major_version": None,
++            "architecture": None,
+         }
+-        sysinfo["type"] = self.check_output("uname -s").lower()
+-        if sysinfo["type"] == "linux":
+-            sysinfo.update(**self._get_linux_sysinfo())
+-        elif sysinfo["type"] == "darwin":
+-            sysinfo.update(**self._get_darwin_sysinfo())
++        uname_s = self.run("uname -s")
++        if uname_s.rc == 0:
++            sysinfo["type"] = uname_s.stdout.strip().lower()
++            if sysinfo["type"] == "linux":
++                sysinfo.update(**self._get_linux_sysinfo())
++            elif sysinfo["type"] == "sunos":
++                sysinfo.update(**self._get_solaris_sysinfo())
++            elif sysinfo["type"] == "windows":
++                sysinfo.update(**self._get_windows_sysinfo())
++            elif sysinfo["type"] == "darwin":
++                sysinfo.update(**self._get_darwin_sysinfo())
++            else:
++                # BSD
++                sysinfo["release"] = self.check_output("uname -r")
++                sysinfo["distribution"] = sysinfo["type"]
++                sysinfo["codename"] = None
+         else:
+-            # BSD
+-            sysinfo["release"] = self.check_output("uname -r")
+-            sysinfo["distribution"] = sysinfo["type"]
+-            sysinfo["codename"] = None
++            ver = self.run("ver")
++            if ver.rc == 0:
++                if "windows" in ver.stdout.strip().lower():
++                    # Windows
++                    sysinfo.update(**self._get_windows_sysinfo())
++
++        self._calculate_release_major_version(sysinfo)
++        self._standardize_distribution(sysinfo)
++
++        logger.debug("Created dict with operating system info:")
++        for line in pprint.pformat(sysinfo).splitlines():
++            logger.debug(line)
++
+         return sysinfo
+ 
+     @property
+@@ -140,6 +228,15 @@ class SystemInfo(InstanceModule):
+         return self.sysinfo["release"]
+ 
+     @property
++    def release_major_version(self):
++        """Distrubtion release major version
++
++        >>> host.system_info.release_major_version
++        '7'
++        """
++        return self.sysinfo["release_major_version"]
++
++    @property
+     def codename(self):
+         """Release code name
+ 
+@@ -149,6 +246,27 @@ class SystemInfo(InstanceModule):
+         return self.sysinfo["codename"]
+ 
+     @property
++    def architecture(self):
++        """Architecture
++
++        >>> host.system_info.architecture
++        'x86_64'
++        """
++        return self.sysinfo["architecture"]
++
++    @property
++    def win_version(self):
++        """Windows version, only for Windows machines
++
++        >>> host.system_info.win_version
++        '6.1.7601'
++        """
++        if self.sysinfo['type'] == 'windows':
++            return self.sysinfo['win_version']
++        else:
++            raise Exception('win_version unavailable for non-Windows machines')
++
++    @property
+     def user(self):
+         return self.check_output("id -nu")
+ 
+@@ -167,3 +285,19 @@ class SystemInfo(InstanceModule):
+     @property
+     def hostname(self):
+         return self.check_output("hostname -s")
++
++    #pylint: disable=no-self-use
++    def _standardize_distribution(self, sysinfo):
++        known_common_distributions = {
++            utils.OS.REDHAT: ['redhatenterpriseserver', 'rhel'],
++            utils.OS.SUSE: ['suse linux'],
++            utils.OS.SOLARIS: ['solaris'],
++        }
++        for distro, values in known_common_distributions.iteritems():
++            if sysinfo['distribution'] in values:
++                sysinfo['distribution'] = distro
++
++    #pylint: disable=no-self-use
++    def _calculate_release_major_version(self, sysinfo):
++        if sysinfo['release'] is not None:
++            sysinfo['release_major_version'] = sysinfo['release'].split('.')[0]

@@ -1,0 +1,24 @@
+diff -Naurp new/testinfra/modules/__init__.py old/testinfra/modules/__init__.py
+--- new/testinfra/modules/__init__.py	2017-05-29 12:30:09.000000000 -0500
++++ old/testinfra/modules/__init__.py	2017-10-04 13:33:04.000000000 -0500
+@@ -11,6 +11,6 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+ from __future__ import unicode_literals
+ 
+ import importlib
+@@ -37,6 +42,13 @@ modules = {
+     'sysctl': 'sysctl:Sysctl',
+     'system_info': 'systeminfo:SystemInfo',
+     'user': 'user:User',
++	'win_environment': 'winenvironment:WinEnvironment',
++	'win_file': 'winfile:WinFile',
++	'win_registry': 'winregistry:WinRegistry',
++	'win_service': 'winservice:WinService',
++	'win_user': 'winuser:WinUser',
++	'hardware_info': 'hardwareinfo:HardwareInfo',
++	'fs_info': 'fsinfo:FSInfo',
+ }
+ 
+ 
